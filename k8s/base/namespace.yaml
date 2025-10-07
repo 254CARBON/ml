@@ -1,0 +1,12 @@
+## Namespace for ML Platform (base)
+# Purpose: Logical boundary for all base resources
+# Notes:
+# - Other overlays (production, staging) may create additional namespaces
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-platform
+  labels:
+    name: ml-platform
+    environment: base

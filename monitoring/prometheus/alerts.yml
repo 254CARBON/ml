@@ -1,0 +1,180 @@
+## Prometheus Alerting Rules
+# Purpose: Define alert rules for ML platform services and infra
+# Notes:
+# - Tune thresholds to match SLOs and typical workloads
+# - Group alerts to minimize noise and add runbooks
+
+groups:
+- name: ml-platform.rules
+  rules:
+  # Service availability alerts
+  - alert: ServiceDown
+    expr: up{job=~"model-serving|embedding-service|search-service|mlflow-server"} == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "ML Platform service is down"
+      description: "Service {{ $labels.job }} has been down for more than 1 minute."
+      
+  # Latency alerts
+  - alert: HighLatency
+    expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 0.5
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High latency detected"
+      description: "P95 latency for {{ $labels.service }} is {{ $value }}s, exceeding 500ms threshold."
+      
+  - alert: CriticalLatency
+    expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1.0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Critical latency detected"
+      description: "P95 latency for {{ $labels.service }} is {{ $value }}s, exceeding 1s threshold."
+      
+  # Error rate alerts
+  - alert: HighErrorRate
+    expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High error rate detected"
+      description: "Error rate for {{ $labels.service }} is {{ $value | humanizePercentage }}, exceeding 5% threshold."
+      
+  - alert: CriticalErrorRate
+    expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.10
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Critical error rate detected"
+      description: "Error rate for {{ $labels.service }} is {{ $value | humanizePercentage }}, exceeding 10% threshold."
+      
+  # ML-specific alerts
+  - alert: ModelInferenceLatencyHigh
+    expr: histogram_quantile(0.95, rate(ml_inference_duration_seconds_bucket[5m])) > 0.12
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Model inference latency high"
+      description: "P95 inference latency for {{ $labels.model_name }} is {{ $value }}s, exceeding 120ms target."
+      
+  - alert: EmbeddingGenerationSlow
+    expr: histogram_quantile(0.95, rate(ml_embedding_duration_seconds_bucket[5m])) > 3.0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Embedding generation slow"
+      description: "P95 embedding generation time for {{ $labels.model_name }} is {{ $value }}s, exceeding 3s target."
+      
+  - alert: SearchLatencyHigh
+    expr: histogram_quantile(0.95, rate(ml_search_duration_seconds_bucket[5m])) > 0.4
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Search latency high"
+      description: "P95 search latency is {{ $value }}s, exceeding 400ms target."
+      
+  # Cache performance alerts
+  - alert: LowCacheHitRate
+    expr: rate(ml_cache_hits_total[5m]) / (rate(ml_cache_hits_total[5m]) + rate(ml_cache_misses_total[5m])) < 0.8
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Low cache hit rate"
+      description: "Cache hit rate for {{ $labels.cache_type }} is {{ $value | humanizePercentage }}, below 80% threshold."
+      
+  # Resource utilization alerts
+  - alert: HighMemoryUsage
+    expr: (container_memory_usage_bytes / container_spec_memory_limit_bytes) > 0.9
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage"
+      description: "Memory usage for {{ $labels.pod }} is {{ $value | humanizePercentage }}, exceeding 90%."
+      
+  - alert: HighCPUUsage
+    expr: rate(container_cpu_usage_seconds_total[5m]) / (container_spec_cpu_quota / container_spec_cpu_period) > 0.9
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU usage"
+      description: "CPU usage for {{ $labels.pod }} is {{ $value | humanizePercentage }}, exceeding 90%."
+      
+  # Database alerts
+  - alert: DatabaseConnectionsHigh
+    expr: pg_stat_database_numbackends / pg_settings_max_connections > 0.8
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High database connections"
+      description: "Database connections are at {{ $value | humanizePercentage }} of maximum."
+      
+  - alert: VectorStoreQuerySlow
+    expr: rate(ml_vector_store_operations_total[5m]) < 10
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Vector store queries slow"
+      description: "Vector store operation rate is {{ $value }} ops/sec, indicating potential performance issues."
+      
+  # Model-specific alerts
+  - alert: ModelNotLoaded
+    expr: ml_model_versions_loaded == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "No models loaded"
+      description: "No model versions are currently loaded for {{ $labels.model_name }}."
+      
+  - alert: ModelReloadFailed
+    expr: increase(ml_model_reload_failures_total[10m]) > 0
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Model reload failed"
+      description: "Model reload failed for {{ $labels.model_name }}. Check logs for details."
+      
+  # Queue alerts (for indexer worker)
+  - alert: QueueBacklogHigh
+    expr: redis_list_length{key="embeddings_rebuild"} > 1000
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High queue backlog"
+      description: "Embedding reindex queue has {{ $value }} items, indicating processing delays."
+      
+  # Business logic alerts
+  - alert: EmbeddingDimensionMismatch
+    expr: increase(ml_embedding_dimension_errors_total[5m]) > 0
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Embedding dimension mismatch"
+      description: "Embedding dimension mismatch detected. This may indicate model version conflicts."
+      
+  - alert: SearchResultsEmpty
+    expr: rate(ml_search_empty_results_total[5m]) / rate(ml_search_requests_total[5m]) > 0.5
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High rate of empty search results"
+      description: "{{ $value | humanizePercentage }} of search requests return empty results."

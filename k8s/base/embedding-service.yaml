@@ -1,0 +1,126 @@
+## Kubernetes manifests for Embedding Service (base)
+# Purpose: Deployment, Service, and HPA for embedding-service
+# Notes:
+# - Prefers GPU nodes via nodeSelector/tolerations when available
+# - Probes target /health on port 9006 (startup may be slower due to model load)
+# - Env from ConfigMap/Secret: ml-platform-config, ml-platform-secrets
+# - Tune GPU requests/limits and EmptyDir cache sizes per hardware
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: embedding-service
+  namespace: ml-platform
+  labels:
+    app: embedding-service
+    service: embedding-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: embedding-service
+  template:
+    metadata:
+      labels:
+        app: embedding-service
+        service: embedding-service
+    spec:
+      nodeSelector:
+        # Prefer GPU nodes for embedding generation
+        accelerator: gpu
+      tolerations:
+      - key: "gpu"
+        operator: "Equal"
+        value: "true"
+        effect: "NoSchedule"
+      containers:
+      - name: embedding-service
+        image: ghcr.io/254carbon/ml-platform-embedding:latest
+        ports:
+        - containerPort: 9006
+          name: http
+        env:
+        - name: ML_EMBEDDING_PORT
+          value: "9006"
+        envFrom:
+        - configMapRef:
+            name: ml-platform-config
+        - secretRef:
+            name: ml-platform-secrets
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+            nvidia.com/gpu: 0  # Request GPU if available
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+            nvidia.com/gpu: 1
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9006
+          initialDelaySeconds: 60  # Longer startup time for model loading
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 9006
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        volumeMounts:
+        - name: model-cache
+          mountPath: /app/model_cache
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: model-cache
+        emptyDir:
+          sizeLimit: 10Gi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: embedding-service
+  namespace: ml-platform
+  labels:
+    app: embedding-service
+spec:
+  selector:
+    app: embedding-service
+  ports:
+  - name: http
+    port: 9006
+    targetPort: 9006
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: embedding-service-hpa
+  namespace: ml-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: embedding-service
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 75
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 85

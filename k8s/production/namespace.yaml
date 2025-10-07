@@ -1,0 +1,31 @@
+## Production Namespace(s) for ML Platform
+# Purpose: Isolate production workloads and blue/green slots
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-platform-production
+  labels:
+    name: ml-platform-production
+    environment: production
+    tier: ml-platform
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-platform-blue
+  labels:
+    name: ml-platform-blue
+    environment: production
+    deployment-slot: blue
+    tier: ml-platform
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-platform-green
+  labels:
+    name: ml-platform-green
+    environment: production
+    deployment-slot: green
+    tier: ml-platform

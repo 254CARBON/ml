@@ -1,0 +1,24 @@
+# Service manifest for indexer-worker
+# Background Celery worker for batch operations.
+
+service_name: indexer-worker
+domain: ml
+runtime: python
+api_contracts: []
+capabilities:
+  - Batch embedding reindexing with retry logic
+  - Event-driven processing with exponential backoff
+  - Vector store backend selection (pgvector/opensearch)
+events_in:
+  - ml.embedding.reindex.request.v1
+events_out:
+  - ml.embedding.generated.v1
+dependencies:
+  internal: [vector-store-adapter]
+  external: [postgres, redis, embedding-service]
+maturity: alpha
+sla:
+  p95_latency_ms: 5000
+  availability: "95.0%"
+owner: ml
+description: "Async worker for large-scale embedding reindexing operations"

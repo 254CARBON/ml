@@ -1,0 +1,209 @@
+## Docker Compose: Test Stack
+# Purpose: Bring up full integration test environment locally/CI
+# Notes:
+# - Includes infra (Postgres/Redis/MinIO) + ML services + test runner
+# - Healthchecks gate service dependencies for stable startup
+
+version: '3.8'
+
+services:
+  # Infrastructure services
+  postgres:
+    image: pgvector/pgvector:pg15
+    environment:
+      POSTGRES_DB: mlflow
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2.4-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:RELEASE.2024-01-31T20-20-33Z
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MLflow server
+  mlflow:
+    build:
+      context: ./service-mlflow
+      dockerfile: Dockerfile
+    environment:
+      ML_ENV: test
+      ML_MLFLOW_BACKEND_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_MLFLOW_ARTIFACT_URI: s3://mlflow-artifacts
+      ML_MINIO_ENDPOINT: http://minio:9000
+      ML_MINIO_ACCESS_KEY: minioadmin
+      ML_MINIO_SECRET_KEY: minioadmin123
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ML services
+  model-serving:
+    build:
+      context: .
+      dockerfile: ./service-model-serving/Dockerfile
+    environment:
+      ML_ENV: test
+      ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_REDIS_URL: redis://redis:6379
+      ML_MLFLOW_TRACKING_URI: http://mlflow:5000
+      ML_MLFLOW_BACKEND_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_MLFLOW_ARTIFACT_URI: s3://mlflow-artifacts
+      ML_MINIO_ENDPOINT: http://minio:9000
+      ML_MINIO_ACCESS_KEY: minioadmin
+      ML_MINIO_SECRET_KEY: minioadmin123
+      ML_MODEL_DEFAULT_NAME: curve_forecaster
+      ML_TRACING_ENABLED: false
+      ML_AB_TESTING_ENABLED: true
+    ports:
+      - "9005:9005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9005/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  embedding-service:
+    build:
+      context: .
+      dockerfile: ./service-embedding/Dockerfile
+    environment:
+      ML_ENV: test
+      ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_REDIS_URL: redis://redis:6379
+      ML_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      ML_MAX_BATCH_SIZE: 64
+      ML_TRACING_ENABLED: false
+    ports:
+      - "9006:9006"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9006/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  search-service:
+    build:
+      context: .
+      dockerfile: ./service-search/Dockerfile
+    environment:
+      ML_ENV: test
+      ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_REDIS_URL: redis://redis:6379
+      ML_EMBEDDING_SERVICE_URL: http://embedding-service:9006
+      ML_SEARCH_FUSION_ALGORITHM: rrf
+      ML_TRACING_ENABLED: false
+    ports:
+      - "9007:9007"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9007/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # Test runner
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      ML_ENV: test
+      ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_REDIS_URL: redis://redis:6379
+      ML_MLFLOW_TRACKING_URI: http://mlflow:5000
+      ML_MLFLOW_BACKEND_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_MLFLOW_ARTIFACT_URI: s3://mlflow-artifacts
+      ML_MINIO_ENDPOINT: http://minio:9000
+      ML_MINIO_ACCESS_KEY: minioadmin
+      ML_MINIO_SECRET_KEY: minioadmin123
+      ML_EMBEDDING_SERVICE_URL: http://embedding-service:9006
+      ML_SEARCH_SERVICE_URL: http://search-service:9007
+      ML_MODEL_SERVING_URL: http://model-serving:9005
+      PYTHONHASHSEED: "0"
+      TZ: UTC
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+      model-serving:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+      search-service:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    command: ["python", "scripts/run_contract_integration_tests.py"]
+    volumes:
+      - .:/app
+      - /app/.venv  # Exclude venv from mount
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  default:
+    name: ml-platform-test

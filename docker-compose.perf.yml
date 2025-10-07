@@ -1,0 +1,59 @@
+# Performance testing override for Docker Compose
+
+version: '3.8'
+
+services:
+  # Override services for performance testing
+  model-serving:
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    environment:
+      - ML_MAX_BATCH_SIZE=512
+      - ML_MODEL_CACHE_SIZE=1000
+    
+  embedding-service:
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+    environment:
+      - ML_MAX_BATCH_SIZE=256
+      - ML_GPU_PREFERENCE=auto
+    
+  search-service:
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    environment:
+      - ML_SEARCH_CACHE_SIZE=10000
+    
+  # Add load testing service
+  locust:
+    image: locustio/locust
+    ports:
+      - "8089:8089"
+    volumes:
+      - ./tests/load:/mnt/locust
+    command: -f /mnt/locust/locustfile.py --host=http://model-serving:9005 --web-host=0.0.0.0
+    depends_on:
+      - model-serving
+      - embedding-service
+      - search-service

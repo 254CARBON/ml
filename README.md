@@ -188,25 +188,64 @@ Contracts pinned via `specs.lock.json` (synced from `254carbon-specs`).
 
 ## 6. ML Lifecycle & Workflows
 
-1. Data prep (external pipelines) produces features & training datasets.
-2. Training script logs:
-   - parameters
-   - metrics
-   - model artifacts
-   - optional lineage tags
-3. MLflow run completes → candidate model staged.
-4. Evaluation script (batch/offline) decides promotion criteria.
-5. Promotion:
-   - Tag in MLflow: Stage → “Production”
-   - Emit `ml.model.promoted.v1`
-   - Model Serving watches event (or polls) → hot reload
-6. A/B or shadow (future):
-   - Deploy multiple versions with traffic shaping
-7. Rollback:
-   - Revert MLflow stage tag
-   - Invalidate runtime cache
+### Overview
 
-Artifacts stored in MinIO bucket: `s3://mlflow-artifacts/{experiment}/{run_id}/`
+1. Data prep (external pipelines) produces features & training datasets.
+2. Training scripts log parameters, metrics, artifacts, and optional lineage metadata into MLflow.
+3. Runs complete → candidate models are staged in MLflow.
+4. Evaluation (batch/offline) decides promotion criteria.
+5. Promotion emits `ml.model.promoted.v1`; model-serving reloads on the event (or scheduled poll).
+6. Optional A/B or shadow deployments shape traffic across model versions.
+7. Rollback reverts the MLflow stage tag and invalidates runtime caches.
+
+Artifacts land in MinIO at `s3://mlflow-artifacts/{experiment}/{run_id}/`.
+
+### Workflow: Train → Promote → Serve (local happy path)
+
+1. Bootstrap the environment (see Section 13) and ensure `ML_ENV=local` in `.env`.
+2. Start the stack: `make docker-up` (or `make dev` for full set of services).
+3. Run or iterate on a training script, e.g.:
+   ```bash
+   cd training/curve_forecaster
+   python train.py --curve-type yield --model-type ensemble
+   ```
+4. Review the run in MLflow (http://localhost:5000) and, when satisfied, promote the artifact:
+   ```bash
+   python ../../scripts/promote_model.py --model curve_forecaster --stage Production
+   ```
+5. Confirm the promotion via the model-serving API:
+   ```bash
+   curl -X POST http://localhost:9005/predict \
+     -H "Content-Type: application/json" \
+     -d '{"inputs":[{"curve_id":"NG_BALMO"}]}'
+   ```
+   A `200` with model metadata indicates the promotion event propagated end-to-end.
+
+### Workflow: Embedding Refresh & Backfill
+
+1. Keep the stack running (`make docker-up`); verify the embedding service health at `http://localhost:9006/health`.
+2. Trigger reindex events per entity type (examples: `instruments`, `curves`, `scenarios`):
+   ```bash
+   python scripts/reindex_all.py --entity instruments --batch-size 256 --model-version latest
+   ```
+3. Tail logs for progress: `docker-compose logs -f embedding-service` (or `make dev-embedding` if running outside Docker).
+4. Spot-check vectors through the API workflow (see docs/API_DOCUMENTATION.md) to ensure new embeddings are persisted.
+
+### Workflow: Search Warm-Up & Validation
+
+1. Seed or update search metadata with the indexing endpoint (repeat per entity):
+   ```bash
+   curl -X POST http://localhost:9007/api/v1/index \
+     -H "Content-Type: application/json" \
+     -d '{"entity_type":"instrument","entity_id":"UST-10Y","text":"UST 10Y benchmark curve commentary","metadata":{"tenor":"10Y"}}'
+   ```
+2. Hit the search API to validate semantic + lexical fusion:
+   ```bash
+   curl -X POST http://localhost:9007/api/v1/search \
+     -H "Content-Type: application/json" \
+     -d '{"query":"front-end curve steepener","semantic":true,"limit":5}'
+   ```
+3. Use the response metadata to compare vector vs. lexical contributions before approving the release. `search.index.updated.v1` events can be monitored to verify downstream consumers observed the refresh.
 
 ---
 
@@ -247,6 +286,8 @@ Artifacts stored in MinIO bucket: `s3://mlflow-artifacts/{experiment}/{run_id}/`
 | `/batch` | POST | Async batch job (returns job_id) |
 | `/models` | GET | List deployed model versions |
 | `/health` | GET | Liveness/readiness |
+| `/experiments` | GET/POST | A/B testing experiments (feature flag) |
+| `/shadow` | GET/POST | Shadow deployment controls (feature flag) |
 | `/metrics` | GET | Prometheus metrics |
 | `/reload` | POST (internal) | Force reload (if event missed) |
 
@@ -325,6 +366,9 @@ Common prefix: `ML_`
 | ML_TRACING_ENABLED | OTel toggle | true |
 | ML_OTEL_EXPORTER | Collector URL | http://otel:4318 |
 | ML_GPU_PREFERENCE | Allowed values | auto |
+| ML_AUTH_ENABLED | Enable JWT authentication | false |
+| ML_AB_TESTING_ENABLED | Enable A/B testing features | false |
+| ML_VECTOR_BACKEND | Vector store backend (pgvector/opensearch) | pgvector |
 
 Per-service config under `service-*/config/`.
 
@@ -332,25 +376,58 @@ Per-service config under `service-*/config/`.
 
 ## 13. Local Development (Multi-Arch + GPU Macs)
 
-Challenges:
-- Mixed amd64 (Linux) + arm64 (Mac w/ GPU)
-- Some embedding models may lack native wheels; prefer pure Python or pre-built
+### Prerequisites
+- Python 3.9+ (use `pyenv` or `uv` to pin versions if juggling projects)
+- Docker Desktop with Compose V2 and BuildKit enabled
+- Optional: Apple Silicon GPU access (set `accelerator` resources in Docker Desktop → Features in development)
+- `make` and `pre-commit` installed locally
 
-Workflow:
-```
+### Bootstrap (once per machine)
+```bash
+python -m venv .venv
+source .venv/bin/activate
 make install
-make dev MODEL=curve_forecaster
+cp env.example .env
 ```
-For GPU node scheduling (Kubernetes):
-- Node labels: `arch=arm64`, `accelerator=gpu`
-- Deployment tolerations to target Mac nodes
-- Fallback to CPU if GPU unavailable
+- Tailor `.env` for local DSNs, credentials, and feature toggles.
+- Install the git hooks with `pre-commit install` (done automatically by `make install`).
 
-Local inference test:
-```
-python scripts/promote_model.py --model curve_forecaster --stage Production
-curl -X POST :9005/predict -d '{"inputs":[{"curve_id":"NG_BALMO"}]}'
-```
+### Start & Stop the Stack
+- Full platform: `make docker-up` (background) or `make dev` (with friendly service summary).
+- Stop everything: `make docker-down` (add `-v` for a clean slate).
+- Service-only loops (hot reload):
+
+| Service | Command | Local URL |
+|---------|---------|-----------|
+| MLflow | `make dev-mlflow` | http://localhost:5000 |
+| Model Serving | `make dev-model-serving` | http://localhost:9005 |
+| Embedding Service | `make dev-embedding` | http://localhost:9006 |
+| Search Service | `make dev-search` | http://localhost:9007 |
+
+### Common Local Workflows
+1. **Happy-path smoke test**
+   ```bash
+   python scripts/promote_model.py --model curve_forecaster --stage Production
+   curl -X POST http://localhost:9005/predict \
+     -H "Content-Type: application/json" \
+     -d '{"inputs":[{"curve_id":"NG_BALMO"}]}'
+   ```
+2. **Embedding sanity check**
+   ```bash
+   curl -X POST http://localhost:9006/api/v1/embed \
+     -H "Content-Type: application/json" \
+     -d '{"inputs":["3m curve steepener commentary"]}'
+   ```
+3. **Run tests & lint**
+   ```bash
+   make test
+   make lint
+   ```
+
+### Multi-Arch / GPU Notes
+- Docker Desktop on Apple Silicon exposes GPUs through `--device /dev/dri` (enable via Docker settings); the embedding service falls back to CPU when GPU acceleration is unavailable.
+- For Kubernetes-based Mac GPU scheduling use node labels `arch=arm64` and `accelerator=gpu`; deployments already include matching tolerations.
+- Prefer pure-Python or pre-built wheel models to avoid local compilation across architectures.
 
 ---
 
@@ -395,6 +472,7 @@ Canary Deploy (future):
 | embedding-service | `embedding_gen_latency_ms`, `embedding_failures_total`, `batch_size_histogram` |
 | search-service | `search_query_latency_ms`, `hybrid_merge_time_ms`, `vector_hits_per_query` |
 | mlflow-server | Proxy metrics (requests, artifact IO) |
+| indexer-worker | `reindex_jobs_total`, `reindex_duration_seconds`, `reindex_failures_total` |
 
 Tracing:
 - Each inference request includes traceparent header (if upstream present)
@@ -410,6 +488,8 @@ Logging Format (JSON):
 ## 17. Security & Policy Considerations
 
 - JWT validation occurs upstream (gateway) but internal verification optional for direct calls.
+- Optional JWT validation via `ML_AUTH_ENABLED` environment variable.
+- Multi-tenant support with optional `tenant_id` parameter in search/index APIs.
 - No PII stored; still treat run metadata as internal.
 - Model artifact integrity (future):
   - Hash recorded in MLflow
@@ -452,6 +532,11 @@ Measure & refine after synthetic load tests.
 Run:
 ```
 make test
+```
+
+For deterministic contract + integration coverage (spins up Postgres/Redis/MinIO/ML services via Docker Compose and resets state before each run):
+```
+make test-contract
 ```
 
 ---

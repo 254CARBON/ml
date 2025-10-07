@@ -1,0 +1,178 @@
+# Docker Compose stack for the ML Platform
+#
+# Services:
+# - postgres: PostgreSQL with pgvector extension for vector similarity.
+# - minio: S3-compatible object storage for MLflow artifacts.
+# - redis: caching + pub/sub + Celery broker.
+# - mlflow-server: model registry and tracking UI.
+# - model-serving / embedding-service / search-service: core microservices.
+# - indexer-worker: background jobs for embeddings.
+# - jaeger: tracing UI and collector.
+
+version: '3.8'
+
+services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: mlflow
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO for MLflow artifacts
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Redis for caching and queues
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MLflow server
+  mlflow-server:
+    build:
+      context: ./service-mlflow
+      dockerfile: Dockerfile
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: s3://mlflow-artifacts
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./service-mlflow/config:/app/config
+
+  # Model serving service
+  model-serving:
+    build:
+      context: ./service-model-serving
+      dockerfile: Dockerfile
+    environment:
+      ML_MODEL_SERVING_PORT: 9005
+      ML_MLFLOW_TRACKING_URI: http://mlflow-server:5000
+      ML_REDIS_URL: redis://redis:6379
+      ML_OTEL_EXPORTER: http://jaeger:14268/api/traces
+    ports:
+      - "9005:9005"
+    depends_on:
+      - mlflow-server
+      - redis
+    volumes:
+      - ./service-model-serving/app:/app/app
+
+  # Embedding service
+  embedding-service:
+    build:
+      context: ./service-embedding
+      dockerfile: Dockerfile
+    environment:
+      ML_EMBEDDING_PORT: 9006
+      ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_REDIS_URL: redis://redis:6379
+      ML_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      ML_GPU_PREFERENCE: auto
+    ports:
+      - "9006:9006"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./service-embedding/app:/app/app
+
+  # Search service
+  search-service:
+    build:
+      context: ./service-search
+      dockerfile: Dockerfile
+    environment:
+      ML_SEARCH_PORT: 9007
+      ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_REDIS_URL: redis://redis:6379
+      ML_EMBEDDING_SERVICE_URL: http://embedding-service:9006
+    ports:
+      - "9007:9007"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      embedding-service:
+        condition: service_started
+    volumes:
+      - ./service-search/app:/app/app
+
+  # Indexer worker
+  indexer-worker:
+    build:
+      context: ./service-indexer-worker
+      dockerfile: Dockerfile
+    environment:
+      ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
+      ML_REDIS_URL: redis://redis:6379
+      ML_EMBEDDING_SERVICE_URL: http://embedding-service:9006
+      ML_INGEST_QUEUE: embeddings_rebuild
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      embedding-service:
+        condition: service_started
+    volumes:
+      - ./service-indexer-worker/app:/app/app
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+
+volumes:
+  postgres_data:
+  minio_data:
+  redis_data:

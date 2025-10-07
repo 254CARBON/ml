@@ -1,0 +1,12 @@
+# Indexer worker dependencies
+celery==5.3.4
+kombu==5.3.4
+redis==5.0.1
+psycopg2-binary==2.9.9
+httpx==0.25.2
+prometheus-client==0.19.0
+opentelemetry-api==1.21.0
+opentelemetry-sdk==1.21.0
+opentelemetry-exporter-prometheus==1.12.0rc1
+structlog==23.2.0
+python-dotenv==1.0.0

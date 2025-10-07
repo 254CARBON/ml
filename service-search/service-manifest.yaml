@@ -1,0 +1,26 @@
+# Service manifest for search-service
+# Provides hybrid semantic + lexical search.
+
+service_name: search-service
+domain: ml
+runtime: python
+api_contracts:
+  - search-api@0.1.0
+capabilities:
+  - Multi-tenant search with optional tenant_id parameter
+  - Hybrid semantic + lexical search with RRF ranking
+  - Optional JWT authentication (feature flag: ML_AUTH_ENABLED)
+  - Vector store backend selection (pgvector/opensearch)
+events_in:
+  - search.index.updated.v1
+events_out:
+  - search.index.updated.v1
+dependencies:
+  internal: [vector-store-adapter]
+  external: [postgres, redis, embedding-service]
+maturity: alpha
+sla:
+  p95_latency_ms: 400
+  availability: "99.0%"
+owner: ml
+description: "Hybrid semantic and lexical search service"

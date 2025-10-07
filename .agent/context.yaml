@@ -1,0 +1,107 @@
+# Agent context for ML platform development
+
+project:
+  name: "254Carbon ML Platform"
+  description: "Machine Learning, Embeddings, Vector Search, and Model Operationalization"
+  version: "0.1.0"
+  repository: "254carbon-ml"
+
+architecture:
+  type: "microservices"
+  runtime: "python"
+  framework: "fastapi"
+  database: "postgresql"
+  cache: "redis"
+  message_queue: "redis"
+  artifact_store: "minio"
+  ml_framework: "mlflow"
+
+services:
+  - name: "mlflow-server"
+    port: 5000
+    status: "beta"
+    purpose: "Experiment tracking and model registry"
+    
+  - name: "model-serving"
+    port: 9005
+    status: "alpha"
+    purpose: "Production model serving with REST API"
+    
+  - name: "embedding-service"
+    port: 9006
+    status: "alpha"
+    purpose: "Embedding generation with batch and on-demand processing"
+    
+  - name: "search-service"
+    port: 9007
+    status: "alpha"
+    purpose: "Hybrid semantic and lexical search"
+    
+  - name: "indexer-worker"
+    port: null
+    status: "planned"
+    purpose: "Async worker for large-scale reindexing"
+
+dependencies:
+  external:
+    - postgresql
+    - redis
+    - minio
+    - jaeger
+  internal:
+    - vector-store-adapter
+    - common-utilities
+
+development:
+  setup_command: "make install"
+  start_command: "make docker-up"
+  test_command: "make test"
+  lint_command: "make lint"
+
+deployment:
+  local: "docker-compose"
+  staging: "kubernetes"
+  production: "kubernetes"
+
+monitoring:
+  metrics: "prometheus"
+  tracing: "jaeger"
+  logging: "structured-json"
+  dashboards: "grafana"
+
+security:
+  authentication: "jwt"
+  authorization: "rbac"
+  secrets: "vault"
+  encryption: "at-rest-and-in-transit"
+
+performance_targets:
+  inference_latency_p95: "120ms"
+  embedding_latency_p95: "3000ms"
+  search_latency_p95: "400ms"
+  throughput_per_pod: "150 req/s"
+
+testing:
+  unit_tests: "pytest"
+  integration_tests: "pytest + docker-compose"
+  contract_tests: "openapi-spec-validator"
+  load_tests: "locust"
+  
+quality:
+  code_formatting: "black"
+  linting: "flake8"
+  type_checking: "mypy"
+  security_scanning: "trivy + safety"
+
+ci_cd:
+  platform: "github-actions"
+  stages:
+    - lint-and-format
+    - unit-tests
+    - integration-tests
+    - contract-tests
+    - security-scan
+    - build-images
+    - deploy-staging
+    - performance-tests
+    - deploy-production

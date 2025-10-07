@@ -1,0 +1,113 @@
+## Ingress for Blue/Green Traffic Shifting (production)
+# Purpose: Routes external traffic to active slot and canary percent
+# Notes:
+# - Control canary via nginx annotations (canary-weight)
+# - Active slot selected by Service selectors in production namespace
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ml-platform-ingress
+  namespace: ml-platform-production
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # Blue-green deployment annotations
+    nginx.ingress.kubernetes.io/canary: "false"
+    nginx.ingress.kubernetes.io/canary-weight: "0"
+spec:
+  tls:
+  - hosts:
+    - ml.254carbon.com
+    - mlflow.254carbon.com
+    secretName: ml-platform-tls
+  rules:
+  - host: ml.254carbon.com
+    http:
+      paths:
+      - path: /api/v1/predict
+        pathType: Prefix
+        backend:
+          service:
+            name: model-serving-active
+            port:
+              number: 9005
+      - path: /api/v1/embed
+        pathType: Prefix
+        backend:
+          service:
+            name: embedding-service-active
+            port:
+              number: 9006
+      - path: /api/v1/search
+        pathType: Prefix
+        backend:
+          service:
+            name: search-service-active
+            port:
+              number: 9007
+      - path: /health
+        pathType: Prefix
+        backend:
+          service:
+            name: health-aggregator
+            port:
+              number: 8080
+  - host: mlflow.254carbon.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: mlflow-server
+            port:
+              number: 5000
+
+---
+# Canary ingress for blue-green deployments
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ml-platform-canary-ingress
+  namespace: ml-platform-production
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "0"  # Start with 0% traffic
+    nginx.ingress.kubernetes.io/canary-by-header: "X-Canary-Deploy"
+    nginx.ingress.kubernetes.io/canary-by-header-value: "true"
+spec:
+  tls:
+  - hosts:
+    - ml.254carbon.com
+    secretName: ml-platform-tls
+  rules:
+  - host: ml.254carbon.com
+    http:
+      paths:
+      - path: /api/v1/predict
+        pathType: Prefix
+        backend:
+          service:
+            name: model-serving-canary
+            port:
+              number: 9005
+      - path: /api/v1/embed
+        pathType: Prefix
+        backend:
+          service:
+            name: embedding-service-canary
+            port:
+              number: 9006
+      - path: /api/v1/search
+        pathType: Prefix
+        backend:
+          service:
+            name: search-service-canary
+            port:
+              number: 9007

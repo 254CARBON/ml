@@ -1,0 +1,25 @@
+# Service manifest for model-serving
+# See field reference description in other manifests for semantics.
+
+service_name: model-serving
+domain: ml
+runtime: python
+api_contracts:
+  - model-serving-api@0.1.0
+capabilities:
+  - A/B testing experiments (feature flag: ML_AB_TESTING_ENABLED)
+  - Shadow deployments
+  - Optional JWT authentication (feature flag: ML_AUTH_ENABLED)
+events_in:
+  - ml.model.promoted.v1
+events_out:
+  - ml.inference.usage.v1
+dependencies:
+  internal: []
+  external: [mlflow, minio, postgres, redis]
+maturity: alpha
+sla:
+  p95_latency_ms: 120
+  availability: "99.0%"
+owner: ml
+description: "Production model serving with REST API endpoints"

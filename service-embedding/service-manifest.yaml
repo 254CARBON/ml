@@ -1,0 +1,32 @@
+# Service manifest for embedding-service
+#
+# Field reference:
+# - service_name: unique service identifier
+# - domain: owning functional area
+# - runtime: primary runtime/language
+# - api_contracts: published API contracts and versions
+# - events_in/out: event streams consumed/emitted
+# - dependencies: internal libs/services and external infra
+# - maturity: lifecycle stage (e.g., alpha/beta/ga)
+# - sla: target SLOs for latency/availability
+# - owner: responsible team
+# - description: concise service summary
+
+service_name: embedding-service
+domain: ml
+runtime: python
+api_contracts:
+  - embedding-api@0.1.0
+events_in:
+  - ml.embedding.reindex.request.v1
+events_out:
+  - ml.embedding.generated.v1
+dependencies:
+  internal: [vector-store-adapter]
+  external: [postgres, redis]
+maturity: alpha
+sla:
+  p95_latency_ms: 3000
+  availability: "99.0%"
+owner: ml
+description: "Embedding generation service with batch and on-demand processing"

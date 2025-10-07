@@ -1,0 +1,111 @@
+## Kubernetes manifests for Model Serving (base)
+# Purpose: Defines Deployment, Service, and HPA for the model-serving service
+# Namespace: ml-platform (base overlays may modify)
+# Key notes:
+# - Update container image to point at the desired version/tag
+# - Probes target /health on port 9005
+# - Env populated from ConfigMap/Secret: ml-platform-config, ml-platform-secrets
+# - HPA scales by CPU/memory utilization (tune thresholds as needed)
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-serving
+  namespace: ml-platform
+  labels:
+    app: model-serving
+    service: model-serving
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: model-serving
+  template:
+    metadata:
+      labels:
+        app: model-serving
+        service: model-serving
+    spec:
+      containers:
+      - name: model-serving
+        image: ghcr.io/254carbon/ml-platform-model-serving:latest
+        ports:
+        - containerPort: 9005
+          name: http
+        env:
+        - name: ML_MODEL_SERVING_PORT
+          value: "9005"
+        envFrom:
+        - configMapRef:
+            name: ml-platform-config
+        - secretRef:
+            name: ml-platform-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9005
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 9005
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: model-cache
+          mountPath: /app/model_cache
+      volumes:
+      - name: model-cache
+        emptyDir: {}
+      
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-serving
+  namespace: ml-platform
+  labels:
+    app: model-serving
+spec:
+  selector:
+    app: model-serving
+  ports:
+  - name: http
+    port: 9005
+    targetPort: 9005
+  type: ClusterIP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: model-serving-hpa
+  namespace: ml-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: model-serving
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
