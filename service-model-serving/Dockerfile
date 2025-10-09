@@ -20,18 +20,22 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies (caching-friendly)
-COPY requirements.txt .
+COPY service-model-serving/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy shared libraries
-COPY ../libs ./libs
+COPY libs ./libs
 
 # Copy application code
-COPY . .
+COPY service-model-serving ./service-model-serving
+RUN ln -s /app/service-model-serving/app /app/app
 
 # Create non-root user for safer runtime
 RUN useradd -m -u 1000 mluser && chown -R mluser:mluser /app
 USER mluser
+
+# Ensure application modules resolve correctly
+ENV PYTHONPATH=/app/service-model-serving:/app
 
 # Expose port
 EXPOSE 9005

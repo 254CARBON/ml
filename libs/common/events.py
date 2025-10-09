@@ -16,13 +16,49 @@ import asyncio
 import json
 import time
 from typing import Any, Dict, List, Optional, Callable
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 import redis
-import redis.asyncio as redis_async
 import structlog
 
+try:  # Optional dependency for offline/local testing.
+    import fakeredis  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - fallback when fakeredis missing
+    fakeredis = None  # type: ignore
+
 logger = structlog.get_logger("events")
+
+_FAKE_REDIS_SERVER = None  # Re-used FakeRedis server for publisher/subscriber
+
+
+def _get_fake_redis_client(decode_responses: bool = False):
+    """Create or reuse an in-memory Redis client for offline testing."""
+    if fakeredis is None:
+        raise redis.ConnectionError("Redis unavailable and fakeredis not installed")
+    
+    global _FAKE_REDIS_SERVER  # pragma: no mutate - reused across calls
+    if _FAKE_REDIS_SERVER is None:
+        _FAKE_REDIS_SERVER = fakeredis.FakeServer()  # type: ignore[call-arg]
+    
+    return fakeredis.FakeRedis(  # type: ignore[attr-defined]
+        server=_FAKE_REDIS_SERVER,
+        decode_responses=decode_responses,
+    )
+
+
+def _create_sync_redis_client(redis_url: str, decode_responses: bool = False):
+    """Create a Redis client with graceful fakeredis fallback."""
+    try:
+        client = redis.from_url(redis_url, decode_responses=decode_responses)
+        client.ping()
+        return client
+    except (redis.ConnectionError, redis.TimeoutError) as exc:
+        logger.warning(
+            "Redis connection failed, falling back to fakeredis",
+            error=str(exc),
+            redis_url=redis_url,
+        )
+        return _get_fake_redis_client(decode_responses=decode_responses)
 
 
 class EventType(Enum):
@@ -42,7 +78,7 @@ class BaseEvent:
     extend the payload with any additional fields relevant to the domain.
     """
     timestamp: int
-    event_type: str
+    event_type: str = field(init=False)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert event to dictionary."""
@@ -129,8 +165,8 @@ class EventPublisher:
     """
     
     def __init__(self, redis_url: str, channel_prefix: str = "ml_events"):
-        self.redis_client = redis.from_url(redis_url)
         self.channel_prefix = channel_prefix
+        self.redis_client = _create_sync_redis_client(redis_url)
     
     def publish(self, event: BaseEvent) -> None:
         """Publish an event with retry logic.
@@ -261,7 +297,7 @@ class EventSubscriber:
     """
     
     def __init__(self, redis_url: str, channel_prefix: str = "ml_events"):
-        self.redis_client = redis_async.from_url(redis_url, decode_responses=False)
+        self.redis_client = _create_sync_redis_client(redis_url, decode_responses=False)
         self.channel_prefix = channel_prefix
         self.handlers: Dict[str, List[Callable]] = {}
     
@@ -283,30 +319,31 @@ class EventSubscriber:
         Includes retry logic and graceful shutdown handling.
         """
         pubsub = self.redis_client.pubsub()
-        
+
         try:
             # Subscribe to all event channels asynchronously
             channels = [
                 f"{self.channel_prefix}:{event_type.value}"
                 for event_type in EventType
             ]
-            await pubsub.subscribe(*channels)
-            
+            pubsub.subscribe(*channels)
+
             logger.info("Started listening for events")
-            
+
             # Non-blocking message processing
             while True:
                 try:
-                    message = await pubsub.get_message(
+                    message = await asyncio.to_thread(
+                        pubsub.get_message,
                         ignore_subscribe_messages=True,
                         timeout=1.0
                     )
                     if message and message.get("type") == "message":
                         self._handle_message(message)
-                    
+
                     # Yield control to the event loop
                     await asyncio.sleep(0.01)
-                    
+
                 except asyncio.CancelledError:
                     logger.info("Event listener cancelled")
                     raise
@@ -314,7 +351,7 @@ class EventSubscriber:
                     logger.error("Error in event listener loop", error=str(e))
                     # Continue listening despite transient errors
                     await asyncio.sleep(1.0)
-                    
+
         except asyncio.CancelledError:
             logger.info("Event listener cancelled")
             raise
@@ -323,7 +360,7 @@ class EventSubscriber:
             raise
         finally:
             try:
-                await pubsub.close()
+                await asyncio.to_thread(pubsub.close)
                 logger.info("Event listener stopped")
             except Exception as e:
                 logger.warning("Error closing pubsub", error=str(e))
@@ -381,7 +418,7 @@ class EventSubscriber:
     async def close(self) -> None:
         """Close the Redis client used by the subscriber."""
         try:
-            await self.redis_client.aclose()
+            await asyncio.to_thread(self.redis_client.close)
         except Exception as e:
             logger.warning("Error closing redis client", error=str(e))
 

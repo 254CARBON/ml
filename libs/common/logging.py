@@ -13,7 +13,7 @@ import logging
 import sys
 from typing import Any, Dict, Optional
 import structlog
-from structlog.stdlib import LoggerFactory
+from structlog.stdlib import LoggerFactory, add_logger_name
 
 
 def configure_logging(
@@ -43,7 +43,7 @@ def configure_logging(
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.add_logger_name,
+        add_logger_name,
     ]
     
     if log_format == "json":

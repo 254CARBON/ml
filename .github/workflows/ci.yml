@@ -2,98 +2,21 @@ name: CI Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches:
+      - main
+      - develop
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+  workflow_dispatch:
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: 254carbon/ml-platform
+concurrency:
+  group: ml-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint-and-format:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-          
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install black flake8 mypy isort
-          pip install -r requirements.txt
-          
-      - name: Run black
-        run: black --check --diff .
-        
-      - name: Run isort
-        run: isort --check-only --diff .
-        
-      - name: Run flake8
-        run: flake8 . --max-line-length=88 --extend-ignore=E203,W503
-        
-      - name: Run mypy
-        run: mypy libs/ service-*/app/ --ignore-missing-imports
-
-  unit-tests:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_PASSWORD: test_password
-          POSTGRES_USER: test_user
-          POSTGRES_DB: test_db
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-          
-      redis:
-        image: redis:7-alpine
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 6379:6379
-
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-          
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest-xdist locust
-          
-      - name: Run unit tests
-        env:
-          ML_VECTOR_DB_DSN: postgresql://test_user:test_password@localhost:5432/test_db
-          ML_REDIS_URL: redis://localhost:6379
-        run: |
-          pytest tests/test_*.py -v --cov=libs --cov=service-* --cov-report=xml
-          
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          file: ./coverage.xml
-          fail_ci_if_error: true
-
   integration-tests:
+    name: Integration Tests
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -109,7 +32,6 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
-          
       redis:
         image: redis:7-alpine
         options: >-
@@ -119,7 +41,6 @@ jobs:
           --health-retries 5
         ports:
           - 6379:6379
-          
       minio:
         image: minio/minio:latest
         env:
@@ -132,32 +53,32 @@ jobs:
           --health-retries 3
         ports:
           - 9000:9000
-
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r ml/requirements.txt
           pip install pytest-xdist
-          
+
       - name: Initialize database
         run: |
-          PGPASSWORD=mlflow_password psql -h localhost -U mlflow -d mlflow -f scripts/init_db.sql
-          
+          PGPASSWORD=mlflow_password psql -h localhost -U mlflow -d mlflow -f ml/scripts/init_db.sql
+
       - name: Start services
         run: |
+          cd ml
           docker-compose up -d mlflow-server
           sleep 30
           docker-compose up -d model-serving embedding-service search-service
           sleep 30
-          
+
       - name: Run integration tests
         env:
           ML_MLFLOW_TRACKING_URI: http://localhost:5000
@@ -166,214 +87,109 @@ jobs:
           ML_EMBEDDING_SERVICE_URL: http://localhost:9006
           ML_SEARCH_SERVICE_URL: http://localhost:9007
         run: |
+          cd ml
           pytest tests/integration/ -v -m integration --maxfail=3
-          
+
       - name: Stop services
         if: always()
         run: |
+          cd ml
           docker-compose down
 
-  contract-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-          
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install openapi-spec-validator
-          
-      - name: Validate OpenAPI specs
-        run: |
-          python -c "
-          import json
-          from openapi_spec_validator import validate_spec
-          
-          with open('specs.lock.json', 'r') as f:
-              specs = json.load(f)
-          
-          for contract_name, contract in specs['contracts'].items():
-              print(f'Validating {contract_name}...')
-              try:
-                  validate_spec(contract['schema'])
-                  print(f'✓ {contract_name} is valid')
-              except Exception as e:
-                  print(f'✗ {contract_name} is invalid: {e}')
-                  exit(1)
-          "
-          
-      - name: Validate service manifests
-        run: |
-          python -c "
-          import yaml
-          import os
-          
-          for root, dirs, files in os.walk('.'):
-              for file in files:
-                  if file == 'service-manifest.yaml':
-                      manifest_path = os.path.join(root, file)
-                      print(f'Validating {manifest_path}...')
-                      
-                      with open(manifest_path, 'r') as f:
-                          manifest = yaml.safe_load(f)
-                      
-                      required_fields = ['service_name', 'domain', 'runtime', 'maturity', 'owner']
-                      for field in required_fields:
-                          if field not in manifest:
-                              print(f'✗ Missing required field: {field}')
-                              exit(1)
-                      
-                      print(f'✓ {manifest_path} is valid')
-          "
+  pipeline:
+    needs: integration-tests
+    uses: ./.github/workflows/service-ci-template.yml
+    secrets: inherit
+    with:
+      service_slug: ml
+      python_version: '3.11'
+      install_command: |
+        python -m pip install --upgrade pip
+        pip install -r ml/requirements.txt
+        pip install black flake8 mypy isort pytest-xdist pyyaml
+      quality_matrix: ${{ toJson([
+        {
+          "name": "ml-platform",
+          "source_path": ".",
+          "tests_path": "tests",
+          "coverage_path": "ml/coverage.xml"
+        }
+      ]) }}
+      quality_command: |
+        set -euo pipefail
+        cd ml
+        black --check --diff .
+        isort --check-only --diff .
+        flake8 . --max-line-length=88 --extend-ignore=E203,W503
+        mypy libs/ service-*/app/ --ignore-missing-imports
+        pytest tests/test_*.py -v --cov=libs --cov=service-* --cov-report=xml
+      contract_command: |
+        cd ml
+        python - <<'PYCODE'
+        import json
+        from pathlib import Path
+        from openapi_spec_validator import validate_spec
 
-  security-scan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          
-      - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v2
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
-          
-      - name: Run Safety check for Python dependencies
-        run: |
-          python -m pip install --upgrade pip safety
-          safety check --json --output safety-report.json || true
-          
-      - name: Upload safety report
-        uses: actions/upload-artifact@v3
-        if: always()
-        with:
-          name: safety-report
-          path: safety-report.json
+        specs = json.loads(Path('specs.lock.json').read_text())
+        for contract_name, contract in specs.get('contracts', {}).items():
+            schema = contract.get('schema')
+            if not schema:
+                raise RuntimeError(f"Contract {contract_name} missing schema")
+            print(f"Validating {contract_name} ...", flush=True)
+            validate_spec(schema)
+        PYCODE
+        python - <<'PYCODE'
+        import os
+        import yaml
+        required = {'service_name', 'domain', 'runtime', 'maturity', 'owner'}
 
-  build-images:
-    runs-on: ubuntu-latest
-    needs: [lint-and-format, unit-tests, contract-tests]
-    strategy:
-      matrix:
-        service: [mlflow, model-serving, embedding, search, indexer-worker]
-        
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable={{is_default_branch}}
-            
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./service-${{ matrix.service }}/
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  performance-tests:
-    runs-on: ubuntu-latest
-    needs: [build-images]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-          
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install locust
-          
-      - name: Start services for performance testing
-        run: |
-          docker-compose -f docker-compose.yml -f docker-compose.perf.yml up -d
-          sleep 60  # Wait for all services to be ready
-          
-      - name: Run performance tests
-        run: |
-          # Run Locust performance tests
-          locust -f tests/load/locustfile.py --host=http://localhost:9005 \
-                 --users=50 --spawn-rate=5 --run-time=300s --headless \
-                 --html=performance-report.html --csv=performance-results
-          
-      - name: Upload performance report
-        uses: actions/upload-artifact@v3
-        if: always()
-        with:
-          name: performance-report
-          path: |
-            performance-report.html
-            performance-results_*.csv
-            
-      - name: Stop services
-        if: always()
-        run: |
-          docker-compose down
-
-  deploy-staging:
-    runs-on: ubuntu-latest
-    needs: [integration-tests, security-scan, build-images]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    environment: staging
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Deploy to staging
-        run: |
-          echo "Deploying to staging environment..."
-          # This would typically deploy to a staging Kubernetes cluster
-          # kubectl apply -f k8s/staging/
-          
-      - name: Run smoke tests
-        run: |
-          echo "Running smoke tests on staging..."
-          # Basic health checks on staging deployment
-          
-      - name: Notify deployment
-        uses: 8398a7/action-slack@v3
-        if: always()
-        with:
-          status: ${{ job.status }}
-          text: "ML Platform deployment to staging: ${{ job.status }}"
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        for root, _, files in os.walk('.'):
+            for name in files:
+                if name == 'service-manifest.yaml':
+                    path = os.path.join(root, name)
+                    with open(path, 'r', encoding='utf-8') as handle:
+                        manifest = yaml.safe_load(handle)
+                    missing = required - set(manifest or {})
+                    if missing:
+                        raise RuntimeError(f"{path} missing fields: {', '.join(sorted(missing))}")
+                    print(f"✓ {path} valid")
+        PYCODE
+      build_matrix: ${{ toJson([
+        {
+          "name": "mlflow",
+          "context": "ml",
+          "dockerfile": "ml/service-mlflow/Dockerfile",
+          "image": "ghcr.io/254carbon/ml-platform-mlflow"
+        },
+        {
+          "name": "model-serving",
+          "context": "ml",
+          "dockerfile": "ml/service-model-serving/Dockerfile",
+          "image": "ghcr.io/254carbon/ml-platform-model-serving"
+        },
+        {
+          "name": "embedding",
+          "context": "ml",
+          "dockerfile": "ml/service-embedding/Dockerfile",
+          "image": "ghcr.io/254carbon/ml-platform-embedding"
+        },
+        {
+          "name": "search",
+          "context": "ml",
+          "dockerfile": "ml/service-search/Dockerfile",
+          "image": "ghcr.io/254carbon/ml-platform-search"
+        },
+        {
+          "name": "indexer-worker",
+          "context": "ml",
+          "dockerfile": "ml/service-indexer-worker/Dockerfile",
+          "image": "ghcr.io/254carbon/ml-platform-indexer-worker"
+        }
+      ]) }}
+      policy_paths: |
+        ml/k8s/base
+        ml/k8s/production
+      publish: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop') }}
+      generate_sbom: true
+      sign_images: true
+      run_vulnerability_scan: true

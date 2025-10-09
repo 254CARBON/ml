@@ -18,7 +18,24 @@ Usage
 
 import os
 from typing import Any, Dict, Optional
-from pydantic import BaseSettings, Field
+
+try:  # Prefer pydantic v2 style imports with backwards compatibility.
+    from pydantic import Field  # type: ignore
+    from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - lightweight fallback for slim test envs
+    class BaseSettings:  # type: ignore
+        """Minimal BaseSettings fallback when pydantic is unavailable."""
+
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+        class Config:  # noqa: D401
+            env_file = ".env"
+            case_sensitive = False
+
+    def Field(default=None, **kwargs):  # type: ignore
+        return default
 
 
 class BaseConfig(BaseSettings):
@@ -32,6 +49,12 @@ class BaseConfig(BaseSettings):
     - Prefer ``Field(..., env="NAME")`` over reading ``os.environ`` directly.
     """
     
+    if "SettingsConfigDict" in globals():  # pragma: no branch
+        model_config = SettingsConfigDict(
+            env_file=".env",
+            case_sensitive=False,
+        )
+    
     # Environment
     ml_env: str = Field(default="local", env="ML_ENV")
     
@@ -40,9 +63,9 @@ class BaseConfig(BaseSettings):
     ml_redis_url: str = Field(default="redis://localhost:6379", env="ML_REDIS_URL")
     
     # MLflow
-    ml_mlflow_tracking_uri: str = Field(default="http://localhost:5000", env="ML_MLFLOW_TRACKING_URI")
+    ml_mlflow_tracking_uri: str = Field(default="file:///tmp/254carbon/mlruns", env="ML_MLFLOW_TRACKING_URI")
     ml_mlflow_backend_dsn: str = Field(default="postgresql://mlflow:mlflow_password@localhost:5432/mlflow", env="ML_MLFLOW_BACKEND_DSN")
-    ml_mlflow_artifact_uri: str = Field(default="s3://mlflow-artifacts", env="ML_MLFLOW_ARTIFACT_URI")
+    ml_mlflow_artifact_uri: str = Field(default="file:///tmp/254carbon/mlruns/artifacts", env="ML_MLFLOW_ARTIFACT_URI")
     
     # MinIO
     ml_minio_endpoint: str = Field(default="http://localhost:9000", env="ML_MINIO_ENDPOINT")
@@ -82,9 +105,10 @@ class BaseConfig(BaseSettings):
     ml_jwt_algorithm: str = Field(default="HS256", env="ML_JWT_ALGORITHM")
     ml_jwt_access_token_expire_minutes: int = Field(default=30, env="ML_JWT_ACCESS_TOKEN_EXPIRE_MINUTES")
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    if "SettingsConfigDict" not in globals():  # pragma: no cover - pydantic v1 path
+        class Config:
+            env_file = ".env"
+            case_sensitive = False
 
 
 class ModelServingConfig(BaseConfig):
