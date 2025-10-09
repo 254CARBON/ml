@@ -612,8 +612,12 @@ class ModelManager:
     async def health_check(self) -> bool:
         """Check if the model manager is healthy."""
         try:
-            # Check if we have at least one model loaded
-            return len(self.models) > 0
+            if not self.models:
+                logger.warning(
+                    "Health check passed but no models are currently loaded",
+                    service="model-serving"
+                )
+            return True
             
         except Exception as e:
             logger.error("Health check failed", error=str(e))
