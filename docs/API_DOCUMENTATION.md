@@ -39,7 +39,6 @@ X-API-Key: <api_key>
    ```
 3. Smoke test health endpoints:
    ```bash
-   curl http://localhost:5000/health   # MLflow
    curl http://localhost:9005/health   # Model Serving
    curl http://localhost:9006/health   # Embedding Service
    curl http://localhost:9007/health   # Search Service

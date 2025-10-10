@@ -33,14 +33,12 @@ make install
 make docker-up
 
 # Verify deployment
-curl http://localhost:5000/health  # MLflow
 curl http://localhost:9005/health  # Model Serving
 curl http://localhost:9006/health  # Embedding Service
 curl http://localhost:9007/health  # Search Service
 ```
 
 ### Service URLs
-- **MLflow UI**: http://localhost:5000
 - **Model Serving API**: http://localhost:9005
 - **Embedding Service API**: http://localhost:9006
 - **Search Service API**: http://localhost:9007

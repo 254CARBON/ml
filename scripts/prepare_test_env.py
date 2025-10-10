@@ -3,7 +3,7 @@
 Prepare deterministic data plane state for contract/integration tests.
 
 This script is executed inside the Docker Compose test-runner container before
-pytest is launched. It resets PostgreSQL (vector store + MLflow metadata),
+pytest is launched. It resets PostgreSQL (vector store metadata),
 flushes Redis, and clears the MinIO artifact bucket so every run starts from a
 known-good baseline. That guarantees tests can be re-run locally/CI without
 leftover state causing flaky behaviour.
@@ -137,7 +137,7 @@ def _minio_client() -> tuple[Minio, str]:
     endpoint = os.environ.get("ML_MINIO_ENDPOINT", "http://minio:9000")
     access_key = os.environ.get("ML_MINIO_ACCESS_KEY", "minioadmin")
     secret_key = os.environ.get("ML_MINIO_SECRET_KEY", "minioadmin123")
-    artifact_uri = os.environ.get("ML_MLFLOW_ARTIFACT_URI", "s3://mlflow-artifacts")
+    artifact_uri = os.environ.get("ML_ARTIFACT_URI", "s3://ml-artifacts")
 
     parsed = urlparse(endpoint)
     secure = parsed.scheme == "https"
@@ -146,7 +146,7 @@ def _minio_client() -> tuple[Minio, str]:
     artifact = urlparse(artifact_uri)
     bucket = artifact.netloc or artifact.path.lstrip("/")
     if not bucket:
-        bucket = "mlflow-artifacts"
+        bucket = "ml-artifacts"
 
     client = Minio(
         host,
@@ -212,7 +212,7 @@ def main() -> None:
         "ML_MINIO_ENDPOINT",
         "ML_MINIO_ACCESS_KEY",
         "ML_MINIO_SECRET_KEY",
-        "ML_MLFLOW_ARTIFACT_URI",
+        "ML_ARTIFACT_URI",
     ]
     missing = [var for var in required_env if not os.environ.get(var)]
     if missing:

@@ -1,7 +1,7 @@
 # Dockerfile for Model Serving Service
 #
 # Purpose:
-# - Package the REST service that loads MLflow models and serves predictions.
+# - Package the REST service that loads ML models and serves predictions.
 # - Based on Python 3.11 slim with minimal system packages.
 #
 # Security & Ops:

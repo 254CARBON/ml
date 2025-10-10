@@ -1,7 +1,7 @@
 """Configuration management for ML platform services.
 
 This module centralizes environment-driven configuration for all services in
-the platform (model serving, embeddings, search, indexer, MLflow). It builds
+the platform (model serving, embeddings, search, indexer). It builds
 on ``pydantic.BaseSettings`` so configuration can be provided via environment
 variables, ``.env`` files, or defaults.
 
@@ -61,11 +61,6 @@ class BaseConfig(BaseSettings):
     # Database
     ml_vector_db_dsn: str = Field(default="postgresql://mlflow:mlflow_password@localhost:5432/mlflow", env="ML_VECTOR_DB_DSN")
     ml_redis_url: str = Field(default="redis://localhost:6379", env="ML_REDIS_URL")
-    
-    # MLflow
-    ml_mlflow_tracking_uri: str = Field(default="file:///tmp/254carbon/mlruns", env="ML_MLFLOW_TRACKING_URI")
-    ml_mlflow_backend_dsn: str = Field(default="postgresql://mlflow:mlflow_password@localhost:5432/mlflow", env="ML_MLFLOW_BACKEND_DSN")
-    ml_mlflow_artifact_uri: str = Field(default="file:///tmp/254carbon/mlruns/artifacts", env="ML_MLFLOW_ARTIFACT_URI")
     
     # MinIO
     ml_minio_endpoint: str = Field(default="http://localhost:9000", env="ML_MINIO_ENDPOINT")
@@ -144,13 +139,6 @@ class SearchConfig(BaseConfig):
     ml_search_service_url: str = Field(default="http://localhost:9007", env="ML_SEARCH_SERVICE_URL")
 
 
-class MLflowConfig(BaseConfig):
-    """Configuration for MLflow server.
-
-    Captures only the parameters specific to the MLflow deployment.
-    """
-    
-    ml_mlflow_port: int = Field(default=5000, env="ML_MLFLOW_PORT")
 
 
 class IndexerConfig(BaseConfig):
@@ -167,7 +155,7 @@ def get_config(service_name: str) -> BaseConfig:
 
     Parameters
     - service_name: Literal name: ``model-serving``, ``embedding``, ``search``,
-      ``mlflow``, or ``indexer``.
+      or ``indexer``.
 
     Returns
     - A concrete ``BaseConfig`` subclass pre‑wired to read the right env vars.
@@ -176,7 +164,6 @@ def get_config(service_name: str) -> BaseConfig:
         "model-serving": ModelServingConfig,
         "embedding": EmbeddingConfig,
         "search": SearchConfig,
-        "mlflow": MLflowConfig,
         "indexer": IndexerConfig,
     }
     

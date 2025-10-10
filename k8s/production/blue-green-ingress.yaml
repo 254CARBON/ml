@@ -23,7 +23,6 @@ spec:
   tls:
   - hosts:
     - ml.254carbon.com
-    - mlflow.254carbon.com
     secretName: ml-platform-tls
   rules:
   - host: ml.254carbon.com
@@ -57,16 +56,6 @@ spec:
             name: health-aggregator
             port:
               number: 8080
-  - host: mlflow.254carbon.com
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: mlflow-server
-            port:
-              number: 5000
 
 ---
 # Canary ingress for blue-green deployments

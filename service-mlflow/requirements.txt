@@ -1,6 +1,0 @@
-# MLflow server dependencies
-mlflow==2.8.1
-psycopg2-binary==2.9.9
-boto3==1.34.0
-minio==7.2.0
-python-dotenv==1.0.0

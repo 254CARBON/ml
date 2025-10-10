@@ -11,10 +11,6 @@ set -e
 
 echo "Building all ML platform services..."
 
-# Build MLflow server
-echo "Building MLflow server..."
-cd service-mlflow
-docker build -t 254carbon/mlflow-server:latest .
 cd ..
 
 # Build model serving service

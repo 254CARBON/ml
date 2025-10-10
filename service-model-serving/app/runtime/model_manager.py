@@ -1,7 +1,7 @@
 """Model manager for loading and serving ML models.
 
-Responsible for discovering, loading, caching, and serving models (primarily
-via MLflow). Provides synchronous prediction APIs and simple batch jobs while
+Responsible for discovering, loading, caching, and serving models from local storage.
+Provides synchronous prediction APIs and simple batch jobs while
 reacting to model promotion events.
 """
 
@@ -10,9 +10,6 @@ import time
 import os
 from typing import Any, Dict, List, Optional, Union, Callable, Awaitable
 from contextlib import suppress
-import mlflow
-import mlflow.sklearn
-import mlflow.pytorch
 import pickle
 import joblib
 import torch
@@ -44,7 +41,7 @@ class ModelManager:
 
     Design
     - Keeps an in‑memory cache keyed by ``name:version``
-    - On startup, attempts to load the default production model
+    - On startup, attempts to load the default production model from local storage
     - Listens for "model promoted" events to refresh active versions
     """
     
@@ -52,16 +49,13 @@ class ModelManager:
         """Create a model manager.
 
         Parameters
-        - config: ``ModelServingConfig`` with MLflow, Redis, logging, etc.
+        - config: ``ModelServingConfig`` with Redis, logging, etc.
         """
         self.config = config
         self.models: Dict[str, Dict[str, Any]] = {}
         self.model_cache: Dict[str, Any] = {}
         self.batch_jobs: Dict[str, Dict[str, Any]] = {}
         self.model_warmup_tasks: Dict[str, asyncio.Task] = {}
-        
-        # Initialize MLflow
-        mlflow.set_tracking_uri(config.ml_mlflow_tracking_uri)
         
         # Initialize event subscriber for model promotions
         self.event_subscriber = EventSubscriber(config.ml_redis_url)
@@ -71,70 +65,9 @@ class ModelManager:
         # Initialize tracing
         self.tracer = get_ml_tracer("model-serving")
         
-        # Initialize circuit breaker for MLflow calls
-        self.mlflow_circuit_breaker = get_circuit_breaker(
-            name="mlflow_service",
-            failure_threshold=3,
-            recovery_timeout=60.0,
-            expected_exception=Exception
-        )
-        self.mlflow_retry_attempts = int(os.getenv("ML_SERVING_MLFLOW_RETRY_ATTEMPTS", "3"))
-        self.mlflow_retry_base_delay = float(os.getenv("ML_SERVING_MLFLOW_RETRY_BASE_DELAY", "2.0"))
-        self.mlflow_retry_max_delay = float(os.getenv("ML_SERVING_MLFLOW_RETRY_MAX_DELAY", "30.0"))
-    
-    async def _execute_mlflow_with_retry(
-        self,
-        func: Callable[[], Awaitable[Any]],
-        operation_name: str,
-        non_retryable_exceptions: Optional[tuple] = None
-    ) -> Any:
-        """Execute MLflow operations with circuit breaker protection and retry."""
-        last_exception: Optional[Exception] = None
-        
-        for attempt in range(1, self.mlflow_retry_attempts + 1):
-            try:
-                return await self.mlflow_circuit_breaker.call(func)
-            except CircuitBreakerError as cb_error:
-                logger.error(
-                    "MLflow circuit breaker open, aborting retries",
-                    operation=operation_name,
-                    error=str(cb_error)
-                )
-                raise
-            except Exception as exc:
-                last_exception = exc
-                
-                if non_retryable_exceptions and isinstance(exc, non_retryable_exceptions):
-                    logger.warning(
-                        "Non-retryable MLflow error encountered",
-                        operation=operation_name,
-                        error=str(exc)
-                    )
-                    raise
-                
-                if attempt == self.mlflow_retry_attempts:
-                    logger.error(
-                        "MLflow operation failed after retries",
-                        operation=operation_name,
-                        attempts=attempt,
-                        error=str(exc)
-                    )
-                    raise
-                
-                delay = min(self.mlflow_retry_base_delay * (2 ** (attempt - 1)), self.mlflow_retry_max_delay)
-                logger.warning(
-                    "MLflow operation failed, retrying",
-                    operation=operation_name,
-                    attempt=attempt,
-                    max_attempts=self.mlflow_retry_attempts,
-                    delay_seconds=delay,
-                    error=str(exc)
-                )
-                await asyncio.sleep(delay)
-        
-        if last_exception:
-            raise last_exception
-        raise RuntimeError(f"Retry logic failed for {operation_name}")
+        # Model storage path
+        self.model_storage_path = Path(os.getenv("ML_MODEL_STORAGE_PATH", "/app/models"))
+        self.model_storage_path.mkdir(parents=True, exist_ok=True)
     
     def _setup_event_handlers(self):
         """Set up event handlers for model promotions."""
@@ -163,9 +96,9 @@ class ModelManager:
             raise
     
     async def _load_default_models(self):
-        """Load default models from MLflow.
+        """Load default models from local storage.
 
-        Attempts to resolve the latest Production version from the registry and
+        Attempts to resolve the latest Production version from local storage and
         warm it into the cache for low‑latency predictions.
         """
         try:
@@ -174,42 +107,54 @@ class ModelManager:
             
             # Try to load the latest production model
             try:
-                client = mlflow.tracking.MlflowClient()
+                model_path = self.model_storage_path / default_model_name / "production"
                 
-                # Check if model exists in registry
-                try:
-                    async def fetch_latest_versions():
-                        return client.get_latest_versions(default_model_name, stages=["Production"])
-                    
-                    model_versions = await self._execute_mlflow_with_retry(
-                        fetch_latest_versions,
-                        operation_name=f"get_latest_versions_{default_model_name}",
-                        non_retryable_exceptions=(mlflow.exceptions.RestException,)
-                    )
-                    
-                    if model_versions:
-                        model_version = model_versions[0]
-                        
-                        async def load_production_model():
-                            return mlflow.sklearn.load_model(f"models:/{default_model_name}/Production")
-                        
-                        model = await self._execute_mlflow_with_retry(
-                            load_production_model,
-                            operation_name=f"load_default_model_{default_model_name}",
-                            non_retryable_exceptions=(mlflow.exceptions.RestException,)
-                        )
-                        await self._cache_model(default_model_name, "Production", model)
-                        logger.info("Loaded default model", model_name=default_model_name, version=model_version.version)
+                if model_path.exists():
+                    model = await self._load_model_from_path(str(model_path))
+                    if model:
+                        await self._cache_model(default_model_name, "production", model)
+                        logger.info("Loaded default model", model_name=default_model_name, version="production")
                     else:
-                        logger.warning("No production model found", model_name=default_model_name)
-                except mlflow.exceptions.RestException:
-                    logger.warning("Model not found in registry", model_name=default_model_name)
+                        logger.warning("Failed to load default model", model_name=default_model_name)
+                else:
+                    logger.warning("No production model found", model_name=default_model_name, path=str(model_path))
                     
             except Exception as e:
                 logger.warning("Failed to load default model", model_name=default_model_name, error=str(e))
                 
         except Exception as e:
             logger.error("Failed to load default models", error=str(e))
+    
+    async def _load_model_from_path(self, model_path: str) -> Optional[Any]:
+        """Load a model from local path."""
+        try:
+            model_path_obj = Path(model_path)
+            
+            # Try different model formats
+            if (model_path_obj / "model.joblib").exists():
+                model = joblib.load(str(model_path_obj / "model.joblib"))
+            elif (model_path_obj / "model.pkl").exists():
+                with open(str(model_path_obj / "model.pkl"), "rb") as f:
+                    model = pickle.load(f)
+            elif (model_path_obj / "model.pth").exists():
+                model = torch.load(str(model_path_obj / "model.pth"), map_location="cpu")
+                model.eval()
+            elif (model_path_obj / "model.py").exists():
+                # Try to load custom model
+                if CurveForecaster is not None:
+                    model = CurveForecaster.load_model(str(model_path_obj))
+                else:
+                    logger.warning("Custom model loader not available", path=model_path)
+                    return None
+            else:
+                logger.warning("No supported model format found", path=model_path)
+                return None
+            
+            return model
+            
+        except Exception as e:
+            logger.error("Failed to load model from path", path=model_path, error=str(e))
+            return None
     
     async def _start_event_listener(self):
         """Start the event listener in background."""
@@ -280,20 +225,13 @@ class ModelManager:
     async def _reload_model(self, model_name: str, version: str):
         """Reload a specific model."""
         try:
-            # Load the new model version with circuit breaker
-            async def load_model():
-                """Fetch model from MLflow for name/version (async wrapper)."""
-                return mlflow.sklearn.load_model(f"models:/{model_name}/{version}")
+            # Load the new model version from local storage
+            model_path = self.model_storage_path / model_name / version
             
-            try:
-                model = await self._execute_mlflow_with_retry(
-                    load_model,
-                    operation_name=f"reload_model_{model_name}_{version}",
-                    non_retryable_exceptions=(mlflow.exceptions.RestException,)
-                )
-            except Exception as e:
-                logger.error("MLflow model loading failed", model_name=model_name, version=version, error=str(e))
-                raise
+            model = await self._load_model_from_path(str(model_path))
+            if not model:
+                logger.error("Failed to load model", model_name=model_name, version=version)
+                return
             
             # Cache the new model
             await self._cache_model(model_name, version, model)
@@ -374,7 +312,7 @@ class ModelManager:
                     # Fallback for array inputs
                     predictions = [[0.02, 0.025, 0.03, 0.035, 0.04] for _ in inputs]  # Mock prediction
                 
-            elif isinstance(model, (mlflow.sklearn.Model, joblib.Memory)) or hasattr(model, 'predict'):
+            elif hasattr(model, 'predict'):
                 # Scikit-learn model
                 if isinstance(inputs[0], dict):
                     # Convert dict inputs to array
@@ -434,25 +372,18 @@ class ModelManager:
         if cache_key in self.model_cache:
             return self.model_cache[cache_key]["model"]
         
-        # Try to load from MLflow with circuit breaker
+        # Try to load from local storage
         try:
-            async def load_model_from_mlflow():
-                """Resolve and load model from MLflow by stage or version."""
-                if model_version == "latest":
-                    return mlflow.sklearn.load_model(f"models:/{model_name}/Production")
-                else:
-                    return mlflow.sklearn.load_model(f"models:/{model_name}/{model_version}")
+            model_path = self.model_storage_path / model_name / model_version
             
-            model = await self._execute_mlflow_with_retry(
-                load_model_from_mlflow,
-                operation_name=f"load_model_{model_name}_{model_version}",
-                non_retryable_exceptions=(mlflow.exceptions.RestException,)
-            )
-            
-            # Cache the model
-            await self._cache_model(model_name, model_version, model)
-            
-            return model
+            model = await self._load_model_from_path(str(model_path))
+            if model:
+                # Cache the model
+                await self._cache_model(model_name, model_version, model)
+                return model
+            else:
+                logger.error("Failed to load model", model_name=model_name, version=model_version)
+                return None
             
         except Exception as e:
             logger.error(

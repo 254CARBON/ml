@@ -52,30 +52,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # MLflow server
-  mlflow:
-    build:
-      context: ./service-mlflow
-      dockerfile: Dockerfile
-    environment:
-      ML_ENV: test
-      ML_MLFLOW_BACKEND_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
-      ML_MLFLOW_ARTIFACT_URI: s3://mlflow-artifacts
-      ML_MINIO_ENDPOINT: http://minio:9000
-      ML_MINIO_ACCESS_KEY: minioadmin
-      ML_MINIO_SECRET_KEY: minioadmin123
-    ports:
-      - "5000:5000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
 
   # ML services
   model-serving:
@@ -86,12 +62,6 @@ services:
       ML_ENV: test
       ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
       ML_REDIS_URL: redis://redis:6379
-      ML_MLFLOW_TRACKING_URI: http://mlflow:5000
-      ML_MLFLOW_BACKEND_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
-      ML_MLFLOW_ARTIFACT_URI: s3://mlflow-artifacts
-      ML_MINIO_ENDPOINT: http://minio:9000
-      ML_MINIO_ACCESS_KEY: minioadmin
-      ML_MINIO_SECRET_KEY: minioadmin123
       ML_MODEL_DEFAULT_NAME: curve_forecaster
       ML_TRACING_ENABLED: false
       ML_AB_TESTING_ENABLED: true
@@ -101,8 +71,6 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      mlflow:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9005/health"]
@@ -169,12 +137,6 @@ services:
       ML_ENV: test
       ML_VECTOR_DB_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
       ML_REDIS_URL: redis://redis:6379
-      ML_MLFLOW_TRACKING_URI: http://mlflow:5000
-      ML_MLFLOW_BACKEND_DSN: postgresql://mlflow:mlflow_password@postgres:5432/mlflow
-      ML_MLFLOW_ARTIFACT_URI: s3://mlflow-artifacts
-      ML_MINIO_ENDPOINT: http://minio:9000
-      ML_MINIO_ACCESS_KEY: minioadmin
-      ML_MINIO_SECRET_KEY: minioadmin123
       ML_EMBEDDING_SERVICE_URL: http://embedding-service:9006
       ML_SEARCH_SERVICE_URL: http://search-service:9007
       ML_MODEL_SERVING_URL: http://model-serving:9005
@@ -184,8 +146,6 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      mlflow:
         condition: service_healthy
       model-serving:
         condition: service_healthy

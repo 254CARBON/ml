@@ -2,7 +2,7 @@
 
 ## Overview
 
-The 254Carbon ML Platform implements a comprehensive model lifecycle management system using MLflow for experiment tracking, model registry, and deployment orchestration.
+The 254Carbon ML Platform implements a comprehensive model lifecycle management system using local storage for experiment tracking, model registry, and deployment orchestration.
 
 ## Lifecycle Stages
 
@@ -30,33 +30,54 @@ The 254Carbon ML Platform implements a comprehensive model lifecycle management 
 - **Archive**: Archive old model versions
 - **Cleanup**: Remove unused artifacts
 
-## MLflow Integration
+## Local Storage Integration
 
 ### Experiment Tracking
 ```python
-import mlflow
+import json
+import os
+from pathlib import Path
 
-with mlflow.start_run():
-    mlflow.log_param("learning_rate", 0.01)
-    mlflow.log_metric("accuracy", 0.95)
-    mlflow.sklearn.log_model(model, "model")
+# Create experiment directory
+exp_dir = Path("/app/models/curve_forecaster/experiments")
+exp_dir.mkdir(parents=True, exist_ok=True)
+
+# Log parameters and metrics
+run_dir = exp_dir / f"run_{int(time.time())}"
+run_dir.mkdir()
+
+with open(run_dir / "params.json", "w") as f:
+    json.dump({"learning_rate": 0.01}, f)
+
+with open(run_dir / "metrics.json", "w") as f:
+    json.dump({"accuracy": 0.95}, f)
+
+# Save model
+import joblib
+joblib.dump(model, run_dir / "model.joblib")
 ```
 
 ### Model Registry
 ```python
 # Register model
-model_version = mlflow.register_model(
-    model_uri="runs:/{run_id}/model",
-    name="curve_forecaster"
-)
+model_dir = Path("/app/models/curve_forecaster/production")
+model_dir.mkdir(parents=True, exist_ok=True)
+joblib.dump(model, model_dir / "model.joblib")
+```
 
-# Transition to staging
-client = mlflow.tracking.MlflowClient()
-client.transition_model_version_stage(
-    name="curve_forecaster",
-    version=model_version.version,
-    stage="Staging"
-)
+### Model Promotion
+```python
+# Promote model to production
+import shutil
+from pathlib import Path
+
+# Copy from staging to production
+staging_dir = Path("/app/models/curve_forecaster/staging")
+production_dir = Path("/app/models/curve_forecaster/production")
+production_dir.mkdir(parents=True, exist_ok=True)
+
+if staging_dir.exists():
+    shutil.copytree(staging_dir, production_dir, dirs_exist_ok=True)
 ```
 
 ### Model Serving

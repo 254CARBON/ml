@@ -38,7 +38,7 @@ This repository bundles early-phase ML + semantic capabilities to minimize opera
 ## 1. Purpose & Scope
 
 This repo standardizes:
-- ML experiment tracking (MLflow 3.x)
+- ML experiment tracking (local storage)
 - Model registry & promotion lifecycle
 - Reusable model serving (REST/gRPC-style via FastAPI initially)
 - Embedding generation (instrument metadata, curve summaries, analytics descriptors)
@@ -59,7 +59,6 @@ Not in scope (lives elsewhere):
 
 | Service | Purpose | Type | Scaling | Status |
 |---------|---------|------|---------|--------|
-| mlflow-server | Experiment tracking + artifact store | Stateful | Vertical + backups | Beta |
 | model-serving | Serve “Production” models via REST (predict/batch) | Stateless | Horizontal | Alpha |
 | embedding-service | Generate embeddings (batch + on-demand) | CPU/GPU aware | Horizontal (GPU preferred) | Alpha |
 | search-service | Hybrid semantic + lexical search aggregator | Stateless | Horizontal | Alpha |
@@ -77,7 +76,6 @@ Not in scope (lives elsewhere):
                               │
                               ▼
                       ┌────────────┐
-                      │ mlflow     │  <─ MinIO (artifacts)
                       │ server     │  <─ Postgres (tracking DB)
                       └─────┬──────┘
                             │ model promoted event
@@ -107,7 +105,6 @@ Not in scope (lives elsewhere):
 
 ```
 /
-  service-mlflow/
     Dockerfile
     config/
     service-manifest.yaml
@@ -174,7 +171,7 @@ events_out:
   - ml.inference.usage.v1
 dependencies:
   internal: []
-  external: [mlflow, minio, postgres, redis]
+  external: [minio, postgres, redis]
 maturity: alpha
 sla:
   p95_latency_ms: 120
@@ -191,14 +188,14 @@ Contracts pinned via `specs.lock.json` (synced from `254carbon-specs`).
 ### Overview
 
 1. Data prep (external pipelines) produces features & training datasets.
-2. Training scripts log parameters, metrics, artifacts, and optional lineage metadata into MLflow.
-3. Runs complete → candidate models are staged in MLflow.
+2. Training scripts log parameters, metrics, artifacts, and optional lineage metadata into local storage.
+3. Runs complete → candidate models are staged in local storage.
 4. Evaluation (batch/offline) decides promotion criteria.
 5. Promotion emits `ml.model.promoted.v1`; model-serving reloads on the event (or scheduled poll).
 6. Optional A/B or shadow deployments shape traffic across model versions.
-7. Rollback reverts the MLflow stage tag and invalidates runtime caches.
+7. Rollback reverts the model stage tag and invalidates runtime caches.
 
-Artifacts land in MinIO at `s3://mlflow-artifacts/{experiment}/{run_id}/`.
+Artifacts land in local storage at `/app/models/{model_name}/{version}/`.
 
 ### Workflow: Train → Promote → Serve (local happy path)
 
@@ -209,7 +206,7 @@ Artifacts land in MinIO at `s3://mlflow-artifacts/{experiment}/{run_id}/`.
    cd training/curve_forecaster
    python train.py --curve-type yield --model-type ensemble
    ```
-4. Review the run in MLflow (http://localhost:5000) and, when satisfied, promote the artifact:
+4. Review the run in local storage and, when satisfied, promote the artifact:
    ```bash
    python ../../scripts/promote_model.py --model curve_forecaster --stage Production
    ```
@@ -328,7 +325,7 @@ All schemas live in `254carbon-specs/events/avro/ml/...`.
 
 | Data Type | Store | Notes |
 |-----------|-------|-------|
-| MLflow tracking | PostgreSQL | DB schema versioned by MLflow |
+| Model storage | Local filesystem | Model files organized by name/version |
 | Artifacts | MinIO | Versioned bucket |
 | Vector embeddings | PgVector table (initial) | Table: `embeddings(entity_type, entity_id, vector, meta, model_version, tenant_id)` |
 | Search metadata | Postgres JSONB | `search_items` table: id, type, text, tags, updated_at |
@@ -355,8 +352,7 @@ Common prefix: `ML_`
 | Variable | Description | Example |
 |----------|-------------|---------|
 | ML_ENV | Environment name | local |
-| ML_MLFLOW_BACKEND_DSN | Tracking DB DSN | postgres://... |
-| ML_MLFLOW_ARTIFACT_URI | Artifact root | s3://mlflow-artifacts |
+| ML_MODEL_STORAGE_PATH | Model storage path | /app/models |
 | ML_MINIO_ENDPOINT | MinIO host | http://minio:9000 |
 | ML_VECTOR_DB_DSN | PgVector/Postgres DSN | postgres://... |
 | ML_MODEL_DEFAULT_NAME | Default model name | curve_forecaster |
@@ -399,7 +395,6 @@ cp env.example .env
 
 | Service | Command | Local URL |
 |---------|---------|-----------|
-| MLflow | `make dev-mlflow` | http://localhost:5000 |
 | Model Serving | `make dev-model-serving` | http://localhost:9005 |
 | Embedding Service | `make dev-embedding` | http://localhost:9006 |
 | Search Service | `make dev-search` | http://localhost:9007 |
@@ -452,8 +447,8 @@ make sbom SERVICE=model-serving
 ## 15. Deployment Flow
 
 1. Update or add model training script (external or here under `/training` if added later)
-2. Run training: logs to MLflow
-3. Promote via script or MLflow UI
+2. Run training: logs to local storage
+3. Promote via script
 4. Event or poll triggers model-serving reload
 5. Embedding service reindex (if embedding model changed)
 6. Search service warms updated hybrid indexes
@@ -471,7 +466,6 @@ Canary Deploy (future):
 | model-serving | `inference_latency_ms`, `inference_requests_total`, `model_version_loaded` |
 | embedding-service | `embedding_gen_latency_ms`, `embedding_failures_total`, `batch_size_histogram` |
 | search-service | `search_query_latency_ms`, `hybrid_merge_time_ms`, `vector_hits_per_query` |
-| mlflow-server | Proxy metrics (requests, artifact IO) |
 | indexer-worker | `reindex_jobs_total`, `reindex_duration_seconds`, `reindex_failures_total` |
 
 Tracing:
@@ -492,7 +486,7 @@ Logging Format (JSON):
 - Multi-tenant support with optional `tenant_id` parameter in search/index APIs.
 - No PII stored; still treat run metadata as internal.
 - Model artifact integrity (future):
-  - Hash recorded in MLflow
+  - Hash recorded in local storage
   - Verify hash at load
 - Access roles (future):
   - `ml_admin`: promotions
@@ -523,7 +517,7 @@ Measure & refine after synthetic load tests.
 | Layer | Type | Tool |
 |-------|------|------|
 | Unit | Pure logic (tokenizers, vector ops) | pytest |
-| Integration | MLflow interaction, vector DB ops | dockerized Postgres |
+| Integration | Model loading, vector DB ops | dockerized Postgres |
 | Contract | OpenAPI schema match | openapi-diff |
 | Performance | Lightweight k6/Locust harness (future) | to add |
 | Reproducibility | Hash check seeds (training scripts) | custom assertions |
@@ -545,7 +539,7 @@ make test-contract
 
 | Internal Allowed | External Calls |
 |------------------|----------------|
-| shared libs (vector_store adapter) | MLflow backend, MinIO, Postgres, Redis |
+| shared libs (vector_store adapter) | MinIO, Postgres, Redis |
 | No direct ingestion pipelines | Only via event payloads |
 | No entitlement logic | Authorization resolved upstream |
 | No gateway logic (routing) | Only API contract implementation |
@@ -596,7 +590,7 @@ Avoid coupling to:
 | Model not reloading | Missed promotion event | POST /reload or check event bus |
 | Slow embeddings | CPU fallback | Check GPU node labels & logs |
 | Search returns nothing | Empty vector index | Run `python scripts/reindex_all.py` |
-| 500 on /predict | Missing model artifact | Validate MLflow artifact path & permissions |
+| 500 on /predict | Missing model artifact | Validate model storage path & permissions |
 | High latency spikes | Cold start / large model | Preload on startup or use warm-reload strategy |
 | Vector mismatch errors | Schema drift (dimension) | Rebuild all embeddings with new model version |
 

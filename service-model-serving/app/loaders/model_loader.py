@@ -5,10 +5,6 @@ import time
 from typing import Any, Dict, List, Optional, Union, Callable
 from pathlib import Path
 import sys
-import mlflow
-import mlflow.sklearn
-import mlflow.pytorch
-import mlflow.tensorflow
 import joblib
 import pickle
 import torch
@@ -48,12 +44,12 @@ class ModelLoader:
     
     async def load_model(
         self,
-        model_uri: str,
+        model_path: str,
         model_name: str,
         model_version: str,
         framework: Optional[str] = None
     ) -> Any:
-        """Load a model from MLflow or local path."""
+        """Load a model from local path."""
         
         with self.tracer.trace_model_inference(
             model_name=model_name,
@@ -64,18 +60,18 @@ class ModelLoader:
             try:
                 # Determine framework if not specified
                 if framework is None:
-                    framework = await self._detect_framework(model_uri)
+                    framework = await self._detect_framework(model_path)
                 
                 span.set_attribute("model.framework", framework)
-                span.set_attribute("model.uri", model_uri)
+                span.set_attribute("model.path", model_path)
                 
                 # Load using appropriate loader
                 if framework in self.supported_frameworks:
                     loader_func = self.supported_frameworks[framework]
-                    model = await loader_func(model_uri, model_name, model_version)
+                    model = await loader_func(model_path, model_name, model_version)
                 else:
-                    # Fallback to MLflow's auto-detection
-                    model = mlflow.pyfunc.load_model(model_uri)
+                    # Fallback to generic loading
+                    model = await self._load_generic_model(model_path, model_name, model_version)
                 
                 # Warm up the model
                 await self._warmup_model(model, model_name, framework)
@@ -85,7 +81,7 @@ class ModelLoader:
                     model_name=model_name,
                     model_version=model_version,
                     framework=framework,
-                    model_uri=model_uri
+                    model_path=model_path
                 )
                 
                 return model
@@ -101,75 +97,56 @@ class ModelLoader:
                 span.set_attribute("error", str(e))
                 raise
     
-    async def _detect_framework(self, model_uri: str) -> str:
+    async def _detect_framework(self, model_path: str) -> str:
         """Detect the ML framework used by the model."""
         try:
-            # Try to get model info from MLflow
-            if model_uri.startswith("models:/") or model_uri.startswith("runs:/"):
-                client = mlflow.tracking.MlflowClient()
-                
-                if model_uri.startswith("models:/"):
-                    # Parse model name and version from URI
-                    parts = model_uri.replace("models:/", "").split("/")
-                    model_name = parts[0]
-                    stage_or_version = parts[1] if len(parts) > 1 else "latest"
-                    
-                    if stage_or_version.isdigit():
-                        model_version = client.get_model_version(model_name, stage_or_version)
-                    else:
-                        versions = client.get_latest_versions(model_name, stages=[stage_or_version])
-                        model_version = versions[0] if versions else None
-                    
-                    if model_version:
-                        run = client.get_run(model_version.run_id)
-                        # Check for framework-specific artifacts
-                        artifacts = client.list_artifacts(model_version.run_id)
-                        
-                        for artifact in artifacts:
-                            if "sklearn" in artifact.path:
-                                return "sklearn"
-                            elif "pytorch" in artifact.path or "torch" in artifact.path:
-                                return "pytorch"
-                            elif "tensorflow" in artifact.path or "tf" in artifact.path:
-                                return "tensorflow"
-                            elif "joblib" in artifact.path:
-                                return "joblib"
-                            elif "pickle" in artifact.path:
-                                return "pickle"
-                
-                elif model_uri.startswith("runs:/"):
-                    run_id = model_uri.split("/")[1]
-                    artifacts = client.list_artifacts(run_id)
-                    
-                    for artifact in artifacts:
-                        if "sklearn" in artifact.path:
-                            return "sklearn"
-                        elif "pytorch" in artifact.path:
-                            return "pytorch"
-                        elif "tensorflow" in artifact.path:
-                            return "tensorflow"
+            model_path_obj = Path(model_path)
+            
+            # Check for framework-specific files
+            if (model_path_obj / "model.joblib").exists():
+                return "joblib"
+            elif (model_path_obj / "model.pkl").exists():
+                return "pickle"
+            elif (model_path_obj / "model.pth").exists():
+                return "pytorch"
+            elif (model_path_obj / "model.py").exists():
+                return "custom"
+            elif (model_path_obj / "sklearn_model.pkl").exists():
+                return "sklearn"
+            elif (model_path_obj / "tensorflow_model").exists():
+                return "tensorflow"
             
             # Default to sklearn if detection fails
             return "sklearn"
             
         except Exception as e:
-            logger.warning("Framework detection failed", model_uri=model_uri, error=str(e))
+            logger.warning("Framework detection failed", model_path=model_path, error=str(e))
             return "sklearn"
     
-    async def _load_sklearn_model(self, model_uri: str, model_name: str, model_version: str) -> Any:
+    async def _load_sklearn_model(self, model_path: str, model_name: str, model_version: str) -> Any:
         """Load scikit-learn model."""
         try:
-            model = mlflow.sklearn.load_model(model_uri)
+            model_path_obj = Path(model_path)
+            sklearn_path = model_path_obj / "sklearn_model.pkl"
+            
+            if sklearn_path.exists():
+                with open(str(sklearn_path), "rb") as f:
+                    model = pickle.load(f)
+            else:
+                # Try to load as joblib
+                model = joblib.load(str(model_path_obj / "model.joblib"))
+            
             logger.info("Loaded sklearn model", model_name=model_name)
             return model
         except Exception as e:
             logger.error("Failed to load sklearn model", error=str(e))
             raise
     
-    async def _load_pytorch_model(self, model_uri: str, model_name: str, model_version: str) -> Any:
+    async def _load_pytorch_model(self, model_path: str, model_name: str, model_version: str) -> Any:
         """Load PyTorch model."""
         try:
-            model = mlflow.pytorch.load_model(model_uri)
+            model_path_obj = Path(model_path)
+            model = torch.load(str(model_path_obj / "model.pth"), map_location="cpu")
             model.eval()  # Set to evaluation mode
             logger.info("Loaded PyTorch model", model_name=model_name)
             return model
@@ -177,56 +154,44 @@ class ModelLoader:
             logger.error("Failed to load PyTorch model", error=str(e))
             raise
     
-    async def _load_tensorflow_model(self, model_uri: str, model_name: str, model_version: str) -> Any:
+    async def _load_tensorflow_model(self, model_path: str, model_name: str, model_version: str) -> Any:
         """Load TensorFlow model."""
         try:
-            model = mlflow.tensorflow.load_model(model_uri)
-            logger.info("Loaded TensorFlow model", model_name=model_name)
-            return model
+            # Note: TensorFlow loading would require tensorflow dependency
+            # For now, return a placeholder
+            logger.warning("TensorFlow model loading not implemented", model_name=model_name)
+            return None
         except Exception as e:
             logger.error("Failed to load TensorFlow model", error=str(e))
             raise
     
-    async def _load_custom_model(self, model_uri: str, model_name: str, model_version: str) -> Any:
+    async def _load_custom_model(self, model_path: str, model_name: str, model_version: str) -> Any:
         """Load custom model (like CurveForecaster)."""
         try:
             # Try to load as CurveForecaster first
             if CurveForecaster is not None:
                 try:
-                    # For MLflow URIs, download the model first
-                    if model_uri.startswith(("models:/", "runs:/")):
-                        local_path = mlflow.artifacts.download_artifacts(model_uri)
-                        model_path = Path(local_path) / "model.joblib"
-                        if model_path.exists():
-                            model = CurveForecaster.load_model(str(model_path))
-                            logger.info("Loaded CurveForecaster model", model_name=model_name)
-                            return model
-                    else:
-                        # Direct file path
-                        model = CurveForecaster.load_model(model_uri)
-                        logger.info("Loaded CurveForecaster model", model_name=model_name)
-                        return model
+                    model = CurveForecaster.load_model(model_path)
+                    logger.info("Loaded CurveForecaster model", model_name=model_name)
+                    return model
                 except Exception as e:
                     logger.warning("Failed to load as CurveForecaster", error=str(e))
             
-            # Fallback to generic MLflow loading
-            model = mlflow.pyfunc.load_model(model_uri)
-            logger.info("Loaded custom model via MLflow pyfunc", model_name=model_name)
+            # Fallback to generic loading
+            model = await self._load_generic_model(model_path, model_name, model_version)
+            logger.info("Loaded custom model via generic loader", model_name=model_name)
             return model
             
         except Exception as e:
             logger.error("Failed to load custom model", error=str(e))
             raise
     
-    async def _load_joblib_model(self, model_uri: str, model_name: str, model_version: str) -> Any:
+    async def _load_joblib_model(self, model_path: str, model_name: str, model_version: str) -> Any:
         """Load joblib-serialized model."""
         try:
-            if model_uri.startswith(("models:/", "runs:/")):
-                local_path = mlflow.artifacts.download_artifacts(model_uri)
-                model_path = Path(local_path) / "model.joblib"
-                model = joblib.load(str(model_path))
-            else:
-                model = joblib.load(model_uri)
+            model_path_obj = Path(model_path)
+            model_path_file = model_path_obj / "model.joblib"
+            model = joblib.load(str(model_path_file))
             
             logger.info("Loaded joblib model", model_name=model_name)
             return model
@@ -234,22 +199,41 @@ class ModelLoader:
             logger.error("Failed to load joblib model", error=str(e))
             raise
     
-    async def _load_pickle_model(self, model_uri: str, model_name: str, model_version: str) -> Any:
+    async def _load_pickle_model(self, model_path: str, model_name: str, model_version: str) -> Any:
         """Load pickle-serialized model."""
         try:
-            if model_uri.startswith(("models:/", "runs:/")):
-                local_path = mlflow.artifacts.download_artifacts(model_uri)
-                model_path = Path(local_path) / "model.pkl"
-                with open(model_path, "rb") as f:
-                    model = pickle.load(f)
-            else:
-                with open(model_uri, "rb") as f:
-                    model = pickle.load(f)
+            model_path_obj = Path(model_path)
+            model_path_file = model_path_obj / "model.pkl"
+            with open(str(model_path_file), "rb") as f:
+                model = pickle.load(f)
             
             logger.info("Loaded pickle model", model_name=model_name)
             return model
         except Exception as e:
             logger.error("Failed to load pickle model", error=str(e))
+            raise
+    
+    async def _load_generic_model(self, model_path: str, model_name: str, model_version: str) -> Any:
+        """Load model using generic approach."""
+        try:
+            model_path_obj = Path(model_path)
+            
+            # Try different file extensions
+            for ext in [".joblib", ".pkl", ".pth"]:
+                model_file = model_path_obj / f"model{ext}"
+                if model_file.exists():
+                    if ext == ".joblib":
+                        return joblib.load(str(model_file))
+                    elif ext == ".pkl":
+                        with open(str(model_file), "rb") as f:
+                            return pickle.load(f)
+                    elif ext == ".pth":
+                        return torch.load(str(model_file), map_location="cpu")
+            
+            raise FileNotFoundError(f"No supported model file found in {model_path}")
+            
+        except Exception as e:
+            logger.error("Failed to load generic model", error=str(e))
             raise
     
     async def _warmup_model(self, model: Any, model_name: str, framework: str):
@@ -270,7 +254,7 @@ class ModelLoader:
                 dummy_df = pd.DataFrame(dummy_data)
                 
                 # Extend DataFrame to meet minimum requirements
-                for i in range(model.lookback_days):
+                for i in range(getattr(model, 'lookback_days', 10)):
                     dummy_df = pd.concat([dummy_df, dummy_df.iloc[-1:]], ignore_index=True)
                 
                 _ = model.predict(dummy_df)
@@ -315,8 +299,9 @@ class ModelLoader:
         try:
             model_name = config["name"]
             model_version = config.get("version", "latest")
+            model_path = config.get("path", f"/app/models/{model_name}/{model_version}")
             
-            model = await self._get_model(model_name, model_version)
+            model = await self.load_model(model_path, model_name, model_version)
             if model:
                 logger.info("Preloaded model", model_name=model_name, model_version=model_version)
             
