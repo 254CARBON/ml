@@ -17,6 +17,7 @@ import asyncpg
 import httpx
 import numpy as np
 import structlog
+from asyncpg import exceptions as pg_exceptions
 
 from libs.common.config import IndexerConfig
 from libs.common.events import EventSubscriber, EventType, create_event_publisher
