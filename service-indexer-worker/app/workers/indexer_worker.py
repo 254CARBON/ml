@@ -11,13 +11,17 @@ Execution model
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from contextlib import suppress
 import asyncpg
 import httpx
 import numpy as np
 import structlog
 from asyncpg import exceptions as pg_exceptions
+from service_model_serving.app.adapters.circuit_breaker import (
+    get_circuit_breaker,
+    CircuitBreakerError,
+)
 
 from libs.common.config import IndexerConfig
 from libs.common.events import EventSubscriber, EventType, create_event_publisher
@@ -51,6 +55,17 @@ class IndexerWorker:
             "ML_VECTOR_DIMENSION": str(config.ml_vector_dimension)
         }
         self.vector_store = create_vector_store_from_env(env_config)
+
+        # Resilience configuration for embedding API calls
+        self.embedding_circuit_breaker = get_circuit_breaker(
+            name="ml-embedding-api",
+            failure_threshold=5,
+            recovery_timeout=30.0,
+            expected_exception=Exception,
+        )
+        self._embedding_retry_attempts = 3
+        self._embedding_retry_base_delay = 1.0
+        self._embedding_retry_max_delay = 8.0
         
         # Initialize event subscriber and publisher
         self.event_publisher = create_event_publisher(config.ml_redis_url)
@@ -145,6 +160,73 @@ class IndexerWorker:
                     error=str(e)
                 )
                 await asyncio.sleep(delay)
+
+    async def _call_embedding_service(self, payload: Dict[str, Any]) -> httpx.Response:
+        """Invoke the embedding service with retry and circuit breaker protection."""
+        attempt = 0
+        last_error: Optional[Exception] = None
+
+        while attempt < self._embedding_retry_attempts:
+            attempt += 1
+            try:
+                async def _request() -> httpx.Response:
+                    if not self.http_client:
+                        raise ValueError("HTTP client not initialized")
+                    return await self.http_client.post(
+                        f"{self.embedding_service_url}/api/v1/embed",
+                        json=payload,
+                    )
+
+                response = await self.embedding_circuit_breaker.call(_request)
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code
+                    if status >= 500 or status == 429:
+                        raise
+                    raise ValueError(f"Embedding service returned status {status}") from exc
+                return response
+
+            except ValueError as non_retryable:
+                logger.error(
+                    "Embedding service returned non-retryable error",
+                    attempt=attempt,
+                    error=str(non_retryable),
+                )
+                raise
+            except CircuitBreakerError as cb_error:
+                logger.error(
+                    "Embedding service circuit breaker open",
+                    attempt=attempt,
+                    error=str(cb_error),
+                )
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self._embedding_retry_attempts:
+                    logger.error(
+                        "Embedding service call failed after retries",
+                        attempts=attempt,
+                        error=str(exc),
+                    )
+                    break
+
+                delay = min(
+                    self._embedding_retry_base_delay * (2 ** (attempt - 1)),
+                    self._embedding_retry_max_delay,
+                )
+                logger.warning(
+                    "Embedding service call failed, retrying",
+                    attempt=attempt,
+                    max_attempts=self._embedding_retry_attempts,
+                    delay_seconds=delay,
+                    error=str(exc),
+                )
+                await asyncio.sleep(delay)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("Embedding service call failed without raising an exception")
     
     async def _handle_reindex_request(self, event_data: Dict[str, Any]):
         """Handle embedding reindex request event.
@@ -169,6 +251,312 @@ class IndexerWorker:
             
         except Exception as e:
             logger.error("Failed to handle reindex request event", error=str(e))
+
+    async def _count_curve_metadata(self, tenant_id: str) -> Tuple[int, int]:
+        """Count available curve metadata rows from aggregated sources.
+
+        Returns a tuple ``(count, query_index)`` where ``query_index`` indicates
+        which source query produced the count so subsequent pagination can reuse
+        the same source when possible.
+        """
+        if not self.db_pool:
+            raise ValueError("Database pool not initialized")
+        
+        queries = [
+            "SELECT COUNT(*) FROM v_curve_metadata WHERE tenant_id = $1",
+            "SELECT COUNT(*) FROM curve_metadata WHERE tenant_id = $1 AND active = TRUE",
+        ]
+        
+        last_count: Optional[int] = None
+        last_index: Optional[int] = None
+        last_error: Optional[Exception] = None
+        
+        async with self.db_pool.acquire() as conn:
+            for idx, query in enumerate(queries):
+                try:
+                    count = await conn.fetchval(query, tenant_id)
+                    count_int = int(count or 0)
+                    if count_int > 0:
+                        return count_int, idx
+                    if last_count is None:
+                        last_count = count_int
+                        last_index = idx
+                except (pg_exceptions.UndefinedTableError, pg_exceptions.UndefinedColumnError) as exc:
+                    last_error = exc
+                    continue
+        
+        if last_count is not None and last_index is not None:
+            return last_count, last_index
+        
+        raise ValueError("Curve metadata source not available") from last_error
+
+    async def _fetch_curve_metadata_batch(
+        self,
+        tenant_id: str,
+        limit: int,
+        offset: int,
+        source_index: int
+    ) -> List[asyncpg.Record]:
+        """Fetch a batch of curve metadata records."""
+        if not self.db_pool:
+            raise ValueError("Database pool not initialized")
+        
+        queries = [
+            """
+            SELECT
+                curve_id,
+                curve_name,
+                commodity,
+                region,
+                contract_months,
+                interpolation_method,
+                metadata,
+                commodity_name,
+                region_name,
+                country,
+                timezone
+            FROM v_curve_metadata
+            WHERE tenant_id = $1
+            ORDER BY curve_id
+            LIMIT $2 OFFSET $3
+            """,
+            """
+            SELECT
+                curve_id,
+                curve_name,
+                commodity,
+                region,
+                contract_months,
+                interpolation_method,
+                metadata,
+                NULL::text AS commodity_name,
+                NULL::text AS region_name,
+                NULL::text AS country,
+                NULL::text AS timezone
+            FROM curve_metadata
+            WHERE tenant_id = $1
+              AND active = TRUE
+            ORDER BY curve_id
+            LIMIT $2 OFFSET $3
+            """,
+        ]
+        
+        async with self.db_pool.acquire() as conn:
+            query_order = [source_index] + [idx for idx in range(len(queries)) if idx != source_index]
+            for idx in query_order:
+                query = queries[idx]
+                try:
+                    rows = await conn.fetch(query, tenant_id, limit, offset)
+                    if rows or idx == query_order[-1]:
+                        return rows
+                except (pg_exceptions.UndefinedTableError, pg_exceptions.UndefinedColumnError):
+                    continue
+        
+        return []
+
+    @staticmethod
+    def _prepare_curve_metadata_payload(record: asyncpg.Record) -> Dict[str, Any]:
+        """Normalize curve metadata record into text, metadata, and tags."""
+        metadata_raw = record.get("metadata")
+        if isinstance(metadata_raw, dict):
+            metadata = dict(metadata_raw)
+        elif metadata_raw is None:
+            metadata = {}
+        else:
+            try:
+                metadata = dict(metadata_raw)  # type: ignore[arg-type]
+            except Exception:
+                metadata = {}
+        
+        contract_months_raw = record.get("contract_months")
+        if isinstance(contract_months_raw, str):
+            contract_months = [part.strip() for part in contract_months_raw.split(",") if part.strip()]
+        elif isinstance(contract_months_raw, list):
+            contract_months = contract_months_raw
+        else:
+            contract_months = []
+        
+        description = metadata.get("description") or record.get("curve_name") or record.get("curve_id")
+        if description and "description" not in metadata:
+            metadata["description"] = description
+        if record.get("curve_id") and "curve_id" not in metadata:
+            metadata["curve_id"] = record.get("curve_id")
+        if record.get("curve_name") and "curve_name" not in metadata:
+            metadata["curve_name"] = record.get("curve_name")
+        commodity = record.get("commodity")
+        commodity_label = record.get("commodity_name") or commodity
+        region = record.get("region")
+        region_label = record.get("region_name") or region
+        interpolation_method = record.get("interpolation_method")
+        
+        meta_payload: Dict[str, Any] = {
+            "curve_id": record.get("curve_id"),
+            "curve_name": record.get("curve_name"),
+            "description": description,
+            "commodity": commodity,
+            "commodity_name": commodity_label,
+            "region": region,
+            "region_name": region_label,
+            "country": record.get("country"),
+            "timezone": record.get("timezone"),
+            "contract_months": contract_months,
+            "interpolation_method": interpolation_method,
+            "metadata": metadata,
+            "source": "aggregated_curve_metadata",
+        }
+        
+        # Build descriptive text for embeddings/search
+        text_parts = []
+        if meta_payload["curve_name"]:
+            text_parts.append(str(meta_payload["curve_name"]))
+        if meta_payload["curve_id"]:
+            text_parts.append(f"Curve ID {meta_payload['curve_id']}")
+        if description and description != meta_payload.get("curve_name"):
+            text_parts.append(str(description))
+        
+        context_parts = []
+        if commodity_label:
+            context_parts.append(f"Commodity {commodity_label}")
+        if region_label:
+            context_parts.append(f"Region {region_label}")
+        if contract_months:
+            context_parts.append(f"Contracts {', '.join(contract_months)}")
+        if interpolation_method:
+            context_parts.append(f"Interpolation {interpolation_method}")
+        if context_parts:
+            text_parts.append("; ".join(context_parts))
+        
+        text = ". ".join(part for part in text_parts if part)
+        
+        tags: List[str] = ["curve"]
+        if commodity:
+            tags.append(str(commodity).lower())
+        if region:
+            tags.append(str(region).lower())
+        tags = list(dict.fromkeys(tag for tag in tags if tag))
+        
+        meta_payload["tags"] = tags
+        
+        return {
+            "text": text,
+            "metadata": meta_payload,
+            "tags": tags,
+        }
+
+    async def _reindex_curve_metadata(
+        self,
+        batch_size: int,
+        model_version: str,
+        tenant_id: str = "default"
+    ) -> Dict[str, Any]:
+        """Reindex aggregated curve metadata into search index and vector store."""
+        start_time = time.time()
+        total_processed = 0
+        total_errors = 0
+        
+        total_count, source_index = await self._count_curve_metadata(tenant_id)
+        source_names = ["v_curve_metadata", "curve_metadata"]
+        source_name = source_names[source_index] if source_index < len(source_names) else "unknown"
+        logger.info(
+            "Starting curve metadata reindex",
+            total_count=total_count,
+            batch_size=batch_size,
+            model_version=model_version,
+            source=source_name
+        )
+        
+        offset = 0
+        while offset < total_count:
+            records = await self._fetch_curve_metadata_batch(tenant_id, batch_size, offset, source_index)
+            if not records:
+                break
+            
+            items: List[Dict[str, Any]] = []
+            async with self.db_pool.acquire() as conn:
+                async with conn.transaction():
+                    for record in records:
+                        try:
+                            prepared = self._prepare_curve_metadata_payload(record)
+                            meta_payload = prepared["metadata"]
+                            await conn.execute(
+                                """
+                                INSERT INTO search_items (entity_type, entity_id, text, meta, tags, tenant_id)
+                                VALUES ($1, $2, $3, $4, $5, $6)
+                                ON CONFLICT (entity_type, entity_id, tenant_id)
+                                DO UPDATE SET
+                                    text = EXCLUDED.text,
+                                    meta = EXCLUDED.meta,
+                                    tags = EXCLUDED.tags,
+                                    updated_at = CURRENT_TIMESTAMP
+                                """,
+                                "curve",
+                                meta_payload["curve_id"],
+                                prepared["text"],
+                                meta_payload,
+                                prepared["tags"],
+                                tenant_id
+                            )
+                            items.append({
+                                "type": "curve",
+                                "id": meta_payload["curve_id"],
+                                "text": prepared["text"],
+                                "metadata": meta_payload,
+                                "tags": prepared["tags"],
+                                "tenant_id": tenant_id
+                            })
+                        except Exception as exc:
+                            total_errors += 1
+                            logger.warning(
+                                "Failed to prepare curve metadata",
+                                curve_id=record.get("curve_id"),
+                                error=str(exc)
+                            )
+            
+            if not items:
+                offset += batch_size
+                continue
+            
+            try:
+                embeddings = await self._generate_embeddings(items, model_version)
+                for idx, embedding in enumerate(embeddings):
+                    embedding.setdefault("tenant_id", items[idx].get("tenant_id", "default"))
+                await self._store_embeddings(embeddings, "curve", model_version)
+                total_processed += len(items)
+            except Exception as exc:
+                total_errors += len(items)
+                logger.error(
+                    "Curve metadata embedding generation failed",
+                    offset=offset,
+                    error=str(exc)
+                )
+            
+            offset += batch_size
+            progress = (min(offset, total_count) / max(total_count, 1)) * 100
+            logger.info(
+                "Curve metadata reindex progress",
+                processed=total_processed,
+                errors=total_errors,
+                progress=f"{progress:.1f}%"
+            )
+            
+            self.metrics_collector.record_vector_store_operation(
+                operation="curve_metadata_reindex",
+                entity_type="curve"
+            )
+        
+        duration = time.time() - start_time
+        result = {
+            "entity_type": "curve",
+            "total_count": total_count,
+            "processed": total_processed,
+            "errors": total_errors,
+            "duration_seconds": duration,
+            "model_version": model_version,
+            "source": source_name
+        }
+        
+        logger.info("Curve metadata reindex completed", **result)
+        return result
     
     async def reindex_entities(
         self,
@@ -186,6 +574,9 @@ class IndexerWorker:
         try:
             if not self.db_pool:
                 raise ValueError("Database pool not initialized")
+            
+            if entity_type in ("curve", "curve_metadata"):
+                return await self._reindex_curve_metadata(batch_size, model_version)
             
             start_time = time.time()
             total_processed = 0
@@ -388,19 +779,10 @@ class IndexerWorker:
         try:
             if not self.http_client:
                 raise ValueError("HTTP client not initialized")
-            
-            # Call embedding service
-            response = await self.http_client.post(
-                f"{self.embedding_service_url}/api/v1/embed",
-                json={
-                    "items": items,
-                    "model": "default"
-                }
-            )
-            
-            if response.status_code != 200:
-                raise ValueError(f"Embedding service returned status {response.status_code}")
-            
+
+            payload = {"items": items, "model": "default"}
+            response = await self._call_embedding_service(payload)
+
             data = response.json()
             vectors = data.get("vectors", [])
             model_version_used = data.get("model_version", model_version)
@@ -408,16 +790,33 @@ class IndexerWorker:
             # Prepare embeddings for storage
             embeddings = []
             for i, vector in enumerate(vectors):
-                embeddings.append({
+                item_metadata = items[i].get("metadata", {})
+                if not isinstance(item_metadata, dict):
+                    item_metadata = {}
+                metadata = dict(item_metadata)
+                metadata.setdefault("text", items[i]["text"])
+                if "tags" in items[i] and "tags" not in metadata:
+                    metadata["tags"] = items[i]["tags"]
+                
+                embedding = {
                     "entity_type": items[i]["type"],
                     "entity_id": items[i]["id"],
                     "vector": vector,
-                    "metadata": {"text": items[i]["text"]},
+                    "metadata": metadata,
                     "model_version": model_version_used
-                })
+                }
+                
+                tenant_id = items[i].get("tenant_id")
+                if tenant_id:
+                    embedding["tenant_id"] = tenant_id
+                
+                embeddings.append(embedding)
             
             return embeddings
             
+        except CircuitBreakerError as cb_error:
+            logger.error("Embedding circuit breaker open", error=str(cb_error))
+            raise
         except Exception as e:
             logger.error("Embedding generation failed", error=str(e))
             raise
@@ -437,7 +836,10 @@ class IndexerWorker:
             # where this worker is executed.
             
             # Store in batch
-            await self.vector_store.batch_store_embeddings(embeddings)
+            tenant_id = "default"
+            if embeddings:
+                tenant_id = embeddings[0].get("tenant_id", "default")
+            await self.vector_store.batch_store_embeddings(embeddings, tenant_id=tenant_id)
             
             logger.info(
                 "Embeddings stored",
